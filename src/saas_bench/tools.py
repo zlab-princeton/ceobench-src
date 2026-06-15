@@ -3200,6 +3200,10 @@ _HIDDEN_TABLES = {{
     '_hidden_group_params_history',  # Post-run analysis: daily group parameter snapshots
     '_hidden_quality_snapshot',      # Post-run analysis: daily quality components per group×plan
     '_hidden_satisfaction_snapshot', # Post-run analysis: daily avg satisfaction per group
+    '_hidden_arena_allocation_log',  # Arena post-run allocation analysis
+    '_hidden_arena_money_transfer_applications',  # Arena transfer idempotency log
+    '_hidden_arena_research_share_applications',  # Arena research-share idempotency log
+    '_hidden_arena_switching_log',  # Arena cross-company switching audit log
     'global_drift_state',           # Internal: global quality drift accumulator
 }}
 

@@ -1,0 +1,15 @@
+{
+  "table": "arena_public_market_snapshots",
+  "description": "Arena-only public competitor snapshots. Populated by the Arena coordinator so companies can observe public rival pricing and plan packaging after weekly advances.",
+  "columns": {
+    "day": "INTEGER \u2014 Simulation day when this public snapshot was recorded",
+    "company_id": "TEXT \u2014 Stable Arena company identifier (e.g., company_0)",
+    "display_name": "TEXT \u2014 Public company name",
+    "price_A": "REAL \u2014 Public Plan A monthly price",
+    "price_B": "REAL \u2014 Public Plan B monthly price",
+    "price_C": "REAL \u2014 Public Plan C monthly price",
+    "tier_A": "INTEGER \u2014 Public Plan A model tier",
+    "tier_B": "INTEGER \u2014 Public Plan B model tier",
+    "tier_C": "INTEGER \u2014 Public Plan C model tier"
+  }
+}

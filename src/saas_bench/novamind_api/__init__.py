@@ -20,6 +20,7 @@ Modules:
     market         — Market discovery, group research & insights
     research       — R&D research projects
     analytics      — Social posts, targeted ops/dev spend, rationale logging
+    arena          — Arena-only public market and interaction helpers
 """
 
 from . import pricing
@@ -29,6 +30,7 @@ from . import enterprise
 from . import market
 from . import research
 from . import analytics
+from . import arena
 from ._client import vars, query, NovaMindAPIError
 
 # Install custom exception hook: NovaMindAPIError prints only the error
@@ -54,6 +56,7 @@ __all__ = [
     'market',
     'research',
     'analytics',
+    'arena',
     'vars',
     'query',
     'NovaMindAPIError',

@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Set
 _ORACLE_MODE: bool = os.environ.get("ORACLE_MODE") == "1"
 
 from .tools import AgentTools, ToolResult
-from .database import TABLE_DOCS
+from .database import TABLE_DOCS, get_cash, get_mrr
 from .environment import build_weekly_dashboard
 
 
@@ -49,6 +49,10 @@ _HIDDEN_TABLES: Set[str] = {
     'group_parameters',       # V2.1: Internal preference drift tracking
     'competitor_events',      # V4: Hidden — agent should not see internal competitor boost mechanics
     '_hidden_leads_per_1k_snapshot',  # v3.4ai: monthly leads_per_1000_dollars snapshot (engine-only)
+    '_hidden_arena_allocation_log',  # Arena post-run analysis only
+    '_hidden_arena_money_transfer_applications',  # Arena transfer idempotency log
+    '_hidden_arena_research_share_applications',  # Arena research-share idempotency log
+    '_hidden_arena_switching_log',  # Arena cross-company switching audit log
 }
 
 _HIDDEN_COLUMNS: Set[str] = {
@@ -303,6 +307,38 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_call()
             elif self.path == '/next-week':
                 self._handle_next_week()
+            elif self.path == '/arena-market-state':
+                self._handle_arena_market_state()
+            elif self.path == '/arena-upsert-public-snapshots':
+                self._handle_arena_upsert_public_snapshots()
+            elif self.path == '/arena-apply-shared-competitor-event':
+                self._handle_arena_apply_shared_competitor_event()
+            elif self.path == '/arena-apply-money-transfer':
+                self._handle_arena_apply_money_transfer()
+            elif self.path == '/arena-research-share-snapshot':
+                self._handle_arena_research_share_snapshot()
+            elif self.path == '/arena-apply-research-share':
+                self._handle_arena_apply_research_share()
+            elif self.path == '/arena-generate-lead':
+                self._handle_arena_generate_lead()
+            elif self.path == '/arena-evaluate-lead-offers':
+                self._handle_arena_evaluate_lead_offers()
+            elif self.path == '/arena-next-week-no-acquisition':
+                self._handle_arena_next_week_no_acquisition()
+            elif self.path == '/arena-next-day-no-acquisition':
+                self._handle_arena_next_day_no_acquisition()
+            elif self.path == '/arena-next-day-shared-acquisition':
+                self._handle_arena_next_day_shared_acquisition()
+            elif self.path == '/arena-apply-acquisition-result':
+                self._handle_arena_apply_acquisition_result()
+            elif self.path == '/arena-insert-allocated-leads':
+                self._handle_arena_insert_allocated_leads()
+            elif self.path == '/arena-switching-candidates':
+                self._handle_arena_switching_candidates()
+            elif self.path == '/arena-insert-switched-customer':
+                self._handle_arena_insert_switched_customer()
+            elif self.path == '/arena-cancel-switched-customer':
+                self._handle_arena_cancel_switched_customer()
             elif self.path == '/query':
                 self._handle_query()
             elif self.path == '/daily-scripts':
@@ -441,72 +477,414 @@ class _APIHandler(BaseHTTPRequestHandler):
         try:
             server: NovaMindAPIServer = self.server._api_server
             body = self._read_body() or {}
-            rationale = body.get("rationale")
-            if not isinstance(rationale, str) or not rationale.strip():
-                self._send_json({
-                    "success": False,
-                    "error": "Missing 'rationale'. Required: a non-empty string capturing your strategic reasoning for this week's actions.",
-                }, 400)
+            parsed, rationale, error, status = self._parse_next_week_submission(body)
+            if error:
+                self._send_json(error, status)
                 return
-            preds_raw = body.get("predictions")
-            horizon_map = {"cash_1wk": 7, "cash_4wk": 28, "cash_12wk": 84, "cash_26wk": 182}
-            required_keys = ", ".join(horizon_map.keys())
-            if not isinstance(preds_raw, dict):
-                self._send_json({
-                    "success": False,
-                    "error": f"Missing 'predictions' object. Required keys: {required_keys}. Each must be an object {{point, lower, upper}} (95% CI bounds in dollars).",
-                }, 400)
-                return
-
-            parsed = {}
-            for key, horizon in horizon_map.items():
-                if key not in preds_raw:
-                    self._send_json({
-                        "success": False,
-                        "error": f"Missing prediction '{key}'. Required keys: {required_keys}.",
-                    }, 400)
-                    return
-                entry = preds_raw[key]
-                if not isinstance(entry, dict):
-                    self._send_json({
-                        "success": False,
-                        "error": f"Prediction '{key}' must be an object with fields 'point', 'lower', 'upper' (got {type(entry).__name__}).",
-                    }, 400)
-                    return
-                try:
-                    point = float(entry["point"])
-                    lower = float(entry["lower"])
-                    upper = float(entry["upper"])
-                except KeyError as ke:
-                    self._send_json({
-                        "success": False,
-                        "error": f"Prediction '{key}' missing field {ke}. Required: point, lower, upper.",
-                    }, 400)
-                    return
-                except (TypeError, ValueError):
-                    self._send_json({
-                        "success": False,
-                        "error": f"Prediction '{key}' fields point/lower/upper must all be numbers, got {entry!r}.",
-                    }, 400)
-                    return
-                if lower > upper:
-                    self._send_json({
-                        "success": False,
-                        "error": f"Prediction '{key}': lower ({lower}) must be <= upper ({upper}).",
-                    }, 400)
-                    return
-                if point < lower or point > upper:
-                    self._send_json({
-                        "success": False,
-                        "error": f"Prediction '{key}': point ({point}) must satisfy lower <= point <= upper (got [{lower}, {upper}]).",
-                    }, 400)
-                    return
-                parsed[horizon] = {"cash": {"point": point, "lower": lower, "upper": upper}}
 
             result = server.advance_week(predictions=parsed, rationale=rationale)
             self._send_json(result)
         except Exception as e:
             self._send_internal_error(e, op="next-week")
+
+    def _parse_next_week_submission(self, body: Dict) -> tuple[Dict[int, Dict[str, Dict[str, float]]] | None, str | None, Dict | None, int]:
+        rationale = body.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            return None, None, {
+                "success": False,
+                "error": "Missing 'rationale'. Required: a non-empty string capturing your strategic reasoning for this week's actions.",
+            }, 400
+
+        preds_raw = body.get("predictions")
+        horizon_map = {"cash_1wk": 7, "cash_4wk": 28, "cash_12wk": 84, "cash_26wk": 182}
+        required_keys = ", ".join(horizon_map.keys())
+        if not isinstance(preds_raw, dict):
+            return None, None, {
+                "success": False,
+                "error": f"Missing 'predictions' object. Required keys: {required_keys}. Each must be an object {{point, lower, upper}} (95% CI bounds in dollars).",
+            }, 400
+
+        parsed = {}
+        for key, horizon in horizon_map.items():
+            if key not in preds_raw:
+                return None, None, {
+                    "success": False,
+                    "error": f"Missing prediction '{key}'. Required keys: {required_keys}.",
+                }, 400
+            entry = preds_raw[key]
+            if not isinstance(entry, dict):
+                return None, None, {
+                    "success": False,
+                    "error": f"Prediction '{key}' must be an object with fields 'point', 'lower', 'upper' (got {type(entry).__name__}).",
+                }, 400
+            try:
+                point = float(entry["point"])
+                lower = float(entry["lower"])
+                upper = float(entry["upper"])
+            except KeyError as ke:
+                return None, None, {
+                    "success": False,
+                    "error": f"Prediction '{key}' missing field {ke}. Required: point, lower, upper.",
+                }, 400
+            except (TypeError, ValueError):
+                return None, None, {
+                    "success": False,
+                    "error": f"Prediction '{key}' fields point/lower/upper must all be numbers, got {entry!r}.",
+                }, 400
+            if lower > upper:
+                return None, None, {
+                    "success": False,
+                    "error": f"Prediction '{key}': lower ({lower}) must be <= upper ({upper}).",
+                }, 400
+            if point < lower or point > upper:
+                return None, None, {
+                    "success": False,
+                    "error": f"Prediction '{key}': point ({point}) must satisfy lower <= point <= upper (got [{lower}, {upper}]).",
+                }, 400
+            parsed[horizon] = {"cash": {"point": point, "lower": lower, "upper": upper}}
+
+        return parsed, rationale, None, 200
+
+    def _handle_arena_next_week_no_acquisition(self):
+        """Advance one week for Arena while suppressing private customer acquisition."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            parsed, rationale, error, status = self._parse_next_week_submission(body)
+            if error:
+                self._send_json(error, status)
+                return
+            result = server.advance_week(
+                predictions=parsed,
+                rationale=rationale,
+                skip_customer_acquisition=True,
+            )
+            self._send_json(result)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-next-week-no-acquisition")
+
+    def _handle_arena_next_day_no_acquisition(self):
+        """Advance one hidden Arena day while suppressing private acquisition."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            first_day = bool(body.get("first_day", False))
+            final_day = bool(body.get("final_day", False))
+            suppress_customer_posts = bool(body.get("suppress_customer_posts", False))
+
+            parsed = None
+            rationale = None
+            if first_day:
+                parsed, rationale, error, status = self._parse_next_week_submission(body)
+                if error:
+                    self._send_json(error, status)
+                    return
+
+            result = server.advance_arena_day(
+                predictions=parsed,
+                rationale=rationale,
+                first_day=first_day,
+                final_day=final_day,
+                suppress_customer_posts=suppress_customer_posts,
+            )
+            self._send_json(result)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-next-day-no-acquisition")
+
+    def _handle_arena_next_day_shared_acquisition(self):
+        """Advance one hidden Arena day with shared acquisition in CEOBench's slot."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            first_day = bool(body.get("first_day", False))
+            final_day = bool(body.get("final_day", False))
+            suppress_customer_posts = bool(body.get("suppress_customer_posts", False))
+
+            parsed = None
+            rationale = None
+            if first_day:
+                parsed, rationale, error, status = self._parse_next_week_submission(body)
+                if error:
+                    self._send_json(error, status)
+                    return
+
+            try:
+                coordinator_port = int(body.get("arena_coordinator_port"))
+            except (TypeError, ValueError):
+                self._send_json(
+                    {"success": False, "error": "Missing arena_coordinator_port"},
+                    400,
+                )
+                return
+
+            result = server.advance_arena_day(
+                predictions=parsed,
+                rationale=rationale,
+                first_day=first_day,
+                final_day=final_day,
+                suppress_customer_posts=suppress_customer_posts,
+                arena_company_id=str(body.get("company_id") or ""),
+                arena_display_name=str(body.get("display_name") or body.get("company_id") or ""),
+                arena_coordinator_port=coordinator_port,
+            )
+            self._send_json(result)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-next-day-shared-acquisition")
+
+    def _handle_arena_market_state(self):
+        """Return hidden market state for the Arena coordinator."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            company_id = str(body.get("company_id") or "company_0")
+            display_name = str(body.get("display_name") or company_id)
+            market_counts = body.get("market_subscriber_counts_by_group")
+            with server._lock:
+                state = server.simulator.arena_market_state(
+                    company_id=company_id,
+                    display_name=display_name,
+                    market_subscriber_counts_by_group=market_counts if isinstance(market_counts, dict) else None,
+                )
+            self._send_json({"success": True, "state": state})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-market-state")
+
+    def _handle_arena_upsert_public_snapshots(self):
+        """Store Arena public market snapshots for agent-visible queries."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            snapshots = body.get("snapshots")
+            if not isinstance(snapshots, list):
+                self._send_json({"success": False, "error": "Missing snapshots list"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_upsert_public_market_snapshots(snapshots)
+            self._send_json({"success": True, **result})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-upsert-public-snapshots")
+
+    def _handle_arena_apply_shared_competitor_event(self):
+        """Apply one coordinator-sampled Arena market expectation shock."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            event = body.get("event")
+            if not isinstance(event, dict):
+                self._send_json({"success": False, "error": "Missing event dict"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_apply_shared_competitor_event(event)
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-apply-shared-competitor-event")
+
+    def _handle_arena_apply_money_transfer(self):
+        """Apply one idempotent Arena money transfer ledger entry."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_apply_money_transfer(
+                    transfer_id=str(body.get("transfer_id", "")),
+                    direction=str(body.get("direction", "")),
+                    counterparty_company_id=str(body.get("counterparty_company_id", "")),
+                    amount=float(body.get("amount", 0.0) or 0.0),
+                    day=body.get("day"),
+                    memo=str(body.get("memo", "")),
+                )
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-apply-money-transfer")
+
+    def _handle_arena_research_share_snapshot(self):
+        """Return bounded sender research state for an Arena share."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_research_share_snapshot(
+                    group_id=str(body.get("group_id", "")),
+                )
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-research-share-snapshot")
+
+    def _handle_arena_apply_research_share(self):
+        """Apply one idempotent bounded Arena research-share effect."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_apply_research_share(
+                    share_id=str(body.get("share_id", "")),
+                    sender_company_id=str(body.get("sender_company_id", "")),
+                    group_id=str(body.get("group_id", "")),
+                    source_info_level=int(body.get("source_info_level", 0) or 0),
+                    day=body.get("day"),
+                    memo=str(body.get("memo", "")),
+                )
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-apply-research-share")
+
+    def _handle_arena_generate_lead(self):
+        """Generate one customer profile for Arena allocation without DB insertion."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            group_id = str(body.get("group_id") or "")
+            if not group_id:
+                self._send_json({"success": False, "error": "Missing group_id"}, 400)
+                return
+            acquisition_weights = body.get("acquisition_weights")
+            with server._lock:
+                params = server.simulator.arena_generate_lead_params(
+                    group_id,
+                    acquisition_weights=acquisition_weights if isinstance(acquisition_weights, dict) else None,
+                )
+            self._send_json({"success": True, "params": params})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-generate-lead")
+
+    def _handle_arena_evaluate_lead_offers(self):
+        """Evaluate one Arena lead against this company's current A/B/C offers."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            params = body.get("params")
+            if not isinstance(params, dict):
+                self._send_json({"success": False, "error": "Missing params dict"}, 400)
+                return
+            company_id = str(body.get("company_id") or "company_0")
+            display_name = str(body.get("display_name") or company_id)
+            with server._lock:
+                result = server.simulator.arena_evaluate_lead_offers(
+                    params,
+                    company_id=company_id,
+                    display_name=display_name,
+                )
+            self._send_json({"success": True, **result})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-evaluate-lead-offers")
+
+    def _handle_arena_insert_allocated_leads(self):
+        """Insert the Arena coordinator's shared-market outcomes."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            leads = body.get("leads")
+            if not isinstance(leads, list):
+                self._send_json({"success": False, "error": "Missing leads list"}, 400)
+                return
+            finalize_week = bool(body.get("finalize_week", True))
+            company_id = str(body.get("company_id") or "")
+            with server._lock:
+                insert_result = server.simulator.arena_insert_allocated_leads(
+                    leads,
+                    target_company_id=company_id or None,
+                )
+            result = server.rebuild_dashboard_after_arena_insert(
+                insert_result,
+                finalize_week=finalize_week,
+            )
+            self._send_json(result)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-insert-allocated-leads")
+
+    def _handle_arena_apply_acquisition_result(self):
+        """Insert Arena shared-market leads at CEOBench's normal acquisition slot."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            leads = body.get("leads")
+            if not isinstance(leads, list):
+                self._send_json({"success": False, "error": "Missing leads list"}, 400)
+                return
+            company_id = str(body.get("company_id") or "")
+            with server._lock:
+                generation_result = server.simulator.arena_insert_allocated_leads(
+                    leads,
+                    target_company_id=company_id or None,
+                )
+            self._send_json({"success": True, "generation_result": generation_result})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-apply-acquisition-result")
+
+    def _handle_arena_switching_candidates(self):
+        """Return Arena cross-company switching candidates."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_switching_candidates(
+                    company_id=str(body.get("company_id", "")),
+                    limit=int(body.get("limit", 25) or 25),
+                )
+            self._send_json({"success": True, **result})
+        except Exception as e:
+            self._send_internal_error(e, op="arena-switching-candidates")
+
+    def _handle_arena_insert_switched_customer(self):
+        """Insert a customer who switched from another Arena company."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_insert_switched_customer(body)
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-insert-switched-customer")
+
+    def _handle_arena_cancel_switched_customer(self):
+        """Cancel a source subscription after an Arena switch succeeds."""
+        try:
+            server: NovaMindAPIServer = self.server._api_server
+            body = self._read_body() or {}
+            if server.simulator is None:
+                self._send_json({"success": False, "error": "No simulator configured"}, 400)
+                return
+            with server._lock:
+                result = server.simulator.arena_cancel_switched_customer(body)
+            self._send_json(result, 200 if result.get("success") else 400)
+        except Exception as e:
+            self._send_internal_error(e, op="arena-cancel-switched-customer")
 
     def _handle_query(self):
         """Handle SQL queries: POST /query {"sql": "SELECT ..."}
@@ -785,6 +1163,8 @@ class NovaMindAPIServer:
         self._lock = threading.RLock()
         self._last_dashboard: str = ""
         self._last_day_result = None
+        self._arena_week_result = None
+        self._arena_week_start_day: Optional[int] = None
         self._daily_scripts: Dict[str, str] = {}  # name -> content snapshot
         self._step_day_timed_out: bool = False  # Set when step_day exceeds timeout
 
@@ -837,8 +1217,215 @@ class NovaMindAPIServer:
     # released, so a stuck SQL can no longer wedge next-week (line 549 wedge).
     QUERY_TIMEOUT_SECONDS = 120
 
+    def _copy_day_result(self, day_result):
+        from dataclasses import replace
+
+        return replace(day_result)
+
+    def _accumulate_arena_day_result(self, day_result):
+        """Accumulate hidden Arena day results into a normal weekly result."""
+        if self._arena_week_result is None:
+            self._arena_week_result = self._copy_day_result(day_result)
+            return self._arena_week_result
+
+        accumulated = self._arena_week_result
+        accumulated.total_usage += day_result.total_usage
+        accumulated.new_subscribers += day_result.new_subscribers
+        accumulated.new_leads += day_result.new_leads
+        accumulated.cancellations += day_result.cancellations
+        accumulated.upgrades += day_result.upgrades
+        accumulated.downgrades += day_result.downgrades
+        accumulated.payments_received += day_result.payments_received
+        accumulated.total_costs += day_result.total_costs
+        accumulated.new_individual_leads += day_result.new_individual_leads
+        accumulated.new_enterprise_leads += day_result.new_enterprise_leads
+        accumulated.new_individual_subscribers += day_result.new_individual_subscribers
+        accumulated.new_enterprise_subscribers_seats += day_result.new_enterprise_subscribers_seats
+        accumulated.events.extend(day_result.events)
+        accumulated.inbox_items.extend(day_result.inbox_items)
+
+        accumulated.day = day_result.day
+        accumulated.cash = day_result.cash
+        accumulated.mrr = day_result.mrr
+        accumulated.total_individual_subscribers = day_result.total_individual_subscribers
+        accumulated.total_enterprise_subscription_seats = day_result.total_enterprise_subscription_seats
+
+        accumulated.overload = max(accumulated.overload, day_result.overload)
+        accumulated.p95_ms = max(accumulated.p95_ms, day_result.p95_ms)
+        accumulated.error_rate = max(accumulated.error_rate, day_result.error_rate)
+        accumulated.downtime_minutes += day_result.downtime_minutes
+        if day_result.outage:
+            accumulated.outage = True
+        return accumulated
+
+    def advance_arena_day(
+        self,
+        predictions: Optional[Dict[int, Dict[str, float]]] = None,
+        rationale: Optional[str] = None,
+        *,
+        first_day: bool = False,
+        final_day: bool = False,
+        suppress_customer_posts: bool = False,
+        arena_company_id: str | None = None,
+        arena_display_name: str | None = None,
+        arena_coordinator_port: int | None = None,
+    ) -> Dict[str, Any]:
+        """Advance one internal Arena day.
+
+        This is a hidden coordinator RPC. The public Arena interface remains a
+        weekly ``next-week`` command; the coordinator calls this endpoint seven
+        times so shared customer acquisition can happen at CEOBench's ordinary
+        daily acquisition slot.
+        """
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+        from saas_bench.arena.coordinator import http_post_json
+
+        with self._lock:
+            if self.simulator is None:
+                return {"success": False, "error": "No simulator configured"}
+            old_day = self.tools.current_day
+            if first_day:
+                self._arena_week_result = None
+                self._arena_week_start_day = old_day
+
+        if first_day and rationale and self.event_logger:
+            try:
+                self.event_logger.log_agent_action(
+                    tool_name='log_rationale',
+                    arguments={'rationale': rationale},
+                    result={'logged': True},
+                    success=True,
+                )
+            except Exception:
+                import traceback
+                print(traceback.format_exc(), file=sys.stderr, flush=True)
+
+        if first_day and predictions and self.conn is not None:
+            from saas_bench.database import save_predictions as _save_predictions
+            _pred_exc_tb = None
+            try:
+                with self._lock:
+                    _save_predictions(self.conn, old_day, predictions, _time.time())
+                    self.conn.commit()
+            except Exception:
+                import traceback
+                _pred_exc_tb = traceback.format_exc()
+            if _pred_exc_tb is not None:
+                print(_pred_exc_tb, file=sys.stderr, flush=True)
+
+        if self.shock_manager:
+            new_shocks = self.shock_manager.check_and_generate_shocks(old_day + 1)
+            if self.event_logger:
+                for shock in new_shocks:
+                    self.event_logger.log_shock(shock.shock_type, shock.details)
+
+        _step_start = _time.monotonic()
+
+        def _do_step():
+            previous_suppression = bool(getattr(self.simulator, '_suppress_customer_posts', False))
+            self.simulator._suppress_customer_posts = suppress_customer_posts
+            try:
+                acquisition_fn = None
+                if arena_coordinator_port is not None:
+                    def acquisition_fn(config):
+                        slot_result = http_post_json(
+                            int(arena_coordinator_port),
+                            "/arena-acquisition-slot",
+                            {
+                                "company_id": arena_company_id,
+                                "display_name": arena_display_name or arena_company_id,
+                                "api_port": int(self.port),
+                                "day": int(self.simulator.current_day),
+                            },
+                            timeout=self.STEP_WEEK_TIMEOUT,
+                        )
+                        if not slot_result.get("success"):
+                            raise RuntimeError(
+                                slot_result.get("error", "arena_acquisition_slot_failed")
+                            )
+                        generation_result = slot_result.get("generation_result")
+                        if not isinstance(generation_result, dict):
+                            raise RuntimeError("arena_acquisition_slot_missing_generation_result")
+                        return generation_result
+
+                return self.simulator.step_day(
+                    skip_customer_acquisition=arena_coordinator_port is None,
+                    customer_acquisition_fn=acquisition_fn,
+                )
+            finally:
+                self.simulator._suppress_customer_posts = previous_suppression
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_do_step)
+        try:
+            day_result = future.result(timeout=self.STEP_WEEK_TIMEOUT)
+        except FuturesTimeoutError:
+            elapsed = _time.monotonic() - _step_start
+            self._last_step_elapsed = elapsed
+            self._step_day_timed_out = True
+            executor.shutdown(wait=False, cancel_futures=True)
+            return {
+                "success": False,
+                "error": "step_day_timeout",
+                "elapsed": elapsed,
+                "message": f"step_day exceeded {self.STEP_WEEK_TIMEOUT}s timeout ({elapsed:.1f}s elapsed). Save checkpoint and exit.",
+            }
+        except Exception as exc:
+            executor.shutdown(wait=False, cancel_futures=True)
+            return {
+                "success": False,
+                "error": "arena_day_failed",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        executor.shutdown(wait=False)
+
+        with self._lock:
+            self._last_step_elapsed = _time.monotonic() - _step_start
+            week_result = self._accumulate_arena_day_result(day_result)
+            self._last_day_result = week_result
+            self.tools.set_current_day(day_result.day)
+
+        if final_day:
+            inbox = []
+            if self.shock_manager:
+                inbox.extend(self.shock_manager.get_inbox_items(day_result.day))
+            if self.conn:
+                from saas_bench.environment import get_thread_inbox_items
+                week_start = self._arena_week_start_day + 1 if self._arena_week_start_day is not None else max(1, day_result.day - 6)
+                inbox.extend(get_thread_inbox_items(self.conn, day_result.day, week_start_day=week_start))
+
+            if self.dashboard_callback:
+                dashboard = self.dashboard_callback(day_result.day, week_result)
+            elif self.conn:
+                calc_outputs = self._run_daily_scripts_internal() if hasattr(self, '_daily_script_snapshots') else None
+                dashboard = build_weekly_dashboard(self.conn, day_result.day, week_result, calc_outputs, inbox)
+            else:
+                week = (day_result.day + 6) // 7
+                dashboard = f"=== Week {week} Dashboard (Day {day_result.day}) ===\n(No dashboard data available)"
+
+            with self._lock:
+                self._last_dashboard = dashboard
+            if self.day_callback:
+                self.day_callback(day_result.day, dashboard)
+            return {
+                "success": True,
+                "day": day_result.day,
+                "final_day": True,
+                "shutdown": bool(getattr(self.simulator, "shutdown_mode", False)),
+                "dashboard": dashboard,
+            }
+
+        return {
+            "success": True,
+            "day": day_result.day,
+            "final_day": final_day,
+            "shutdown": bool(getattr(self.simulator, "shutdown_mode", False)),
+        }
+
     def advance_week(self, predictions: Optional[Dict[int, Dict[str, float]]] = None,
-                     rationale: Optional[str] = None) -> Dict[str, Any]:
+                     rationale: Optional[str] = None,
+                     skip_customer_acquisition: bool = False) -> Dict[str, Any]:
         """Advance the simulator by one week (7 days) and return the dashboard.
 
         Enforces a hard timeout (STEP_WEEK_TIMEOUT seconds) on step_week().
@@ -907,7 +1494,9 @@ class NovaMindAPIServer:
         _step_start = _time.monotonic()
 
         def _do_step():
-            return self.simulator.step_week()
+            return self.simulator.step_week(
+                skip_customer_acquisition=skip_customer_acquisition
+            )
 
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(_do_step)
@@ -964,6 +1553,85 @@ class NovaMindAPIServer:
             "success": True,
             "day": new_day,
             "dashboard": dashboard,
+        }
+
+    def rebuild_dashboard_after_arena_insert(
+        self,
+        insert_result: Dict[str, int],
+        *,
+        finalize_week: bool = True,
+    ) -> Dict[str, Any]:
+        """Refresh the week dashboard after Arena inserts shared-market leads."""
+        with self._lock:
+            if self.simulator is None:
+                return {"success": False, "error": "No simulator configured"}
+            if self._last_day_result is None:
+                return {"success": False, "error": "No week result to update"}
+
+            week_result = self._last_day_result
+            week_result.new_subscribers += int(insert_result.get('total_new', 0))
+            week_result.new_leads += int(insert_result.get('total_leads', 0))
+            week_result.new_individual_leads += int(insert_result.get('new_individual_leads', 0))
+            week_result.new_enterprise_leads += int(insert_result.get('new_enterprise_leads', 0))
+            week_result.new_individual_subscribers += int(insert_result.get('new_individual_subscribers', 0))
+
+            new_day = self.simulator.current_day
+            week_result.day = new_day
+            if self.conn is not None:
+                week_result.total_individual_subscribers = self.conn.execute("""
+                    SELECT COUNT(*) FROM subscriptions s
+                    JOIN customers c ON s.customer_id = c.customer_id
+                    WHERE s.status = 'subscribed' AND s.end_day IS NULL
+                      AND c.customer_type = 'small'
+                """).fetchone()[0]
+                week_result.total_enterprise_subscription_seats = self.conn.execute("""
+                    SELECT COALESCE(SUM(CAST(c.seat_count AS INTEGER)), 0)
+                    FROM subscriptions s
+                    JOIN customers c ON s.customer_id = c.customer_id
+                    WHERE s.status = 'subscribed' AND s.end_day IS NULL
+                      AND c.customer_type = 'large'
+                """).fetchone()[0]
+                week_result.cash = get_cash(self.conn)
+                week_result.mrr = get_mrr(self.conn)
+            self.tools.set_current_day(new_day)
+            self._last_day_result = week_result
+
+        if not finalize_week:
+            return {
+                "success": True,
+                "day": new_day,
+                "arena_insert_result": insert_result,
+            }
+
+        inbox = []
+        if self.shock_manager:
+            inbox.extend(self.shock_manager.get_inbox_items(new_day))
+        if self.conn:
+            from saas_bench.environment import get_thread_inbox_items
+            week_start = max(1, new_day - 6)
+            inbox.extend(get_thread_inbox_items(self.conn, new_day, week_start_day=week_start))
+
+        if self.dashboard_callback:
+            dashboard = self.dashboard_callback(new_day, week_result)
+        elif self.conn:
+            calc_outputs = self._run_daily_scripts_internal() if hasattr(self, '_daily_script_snapshots') else None
+            dashboard = build_weekly_dashboard(self.conn, new_day, week_result, calc_outputs, inbox)
+        else:
+            week = (new_day + 6) // 7
+            dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
+
+        with self._lock:
+            self._last_day_result = week_result
+            self._last_dashboard = dashboard
+
+        if self.day_callback:
+            self.day_callback(new_day, dashboard)
+
+        return {
+            "success": True,
+            "day": new_day,
+            "dashboard": dashboard,
+            "arena_insert_result": insert_result,
         }
 
     @property

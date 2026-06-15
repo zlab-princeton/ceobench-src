@@ -69,6 +69,7 @@ _ENGINE_API_MODULES = [
     "__init__",
     "_client",
     "analytics",
+    "arena",
     "enterprise",
     "infrastructure",
     "market",
@@ -76,6 +77,25 @@ _ENGINE_API_MODULES = [
     "pricing",
     "research",
 ]
+
+_ENGINE_SUBPACKAGE_MODULES = {
+    "arena": [
+        "__init__",
+        "company",
+        "coordinator",
+        "interactions",
+        "shared_market",
+    ],
+    "agents": [
+        "__init__",
+        "base",
+    ],
+    "agents/bash_agent": [
+        "__init__",
+        "arena_runner",
+        "run_test",
+    ],
+}
 
 
 def step(msg: str):
@@ -241,6 +261,23 @@ def _build_zipapp():
             dst_file = engine_dir / f"{mod_name}.pyc"
             _compile_pyc(src_file, dst_file, f"saas_bench/{mod_name}.py")
             compiled += 1
+
+        for package_name, module_names in _ENGINE_SUBPACKAGE_MODULES.items():
+            package_src_dir = SRC_DIR / package_name
+            package_dst_dir = engine_dir / package_name
+            package_dst_dir.mkdir(parents=True, exist_ok=True)
+            for mod_name in module_names:
+                src_file = package_src_dir / f"{mod_name}.py"
+                if not src_file.exists():
+                    print(f"  ⚠️  Missing: {src_file}")
+                    continue
+                dst_file = package_dst_dir / f"{mod_name}.pyc"
+                _compile_pyc(
+                    src_file,
+                    dst_file,
+                    f"saas_bench/{package_name}/{mod_name}.py",
+                )
+                compiled += 1
 
         # saas_bench/novamind_api/*.pyc for engine internal use
         engine_api_dir = engine_dir / "novamind_api"

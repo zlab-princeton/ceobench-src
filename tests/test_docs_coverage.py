@@ -21,6 +21,8 @@ _HIDDEN_TABLES = {
     'group_insight_snapshots',
     '_hidden_group_params_history', '_hidden_quality_snapshot',
     '_hidden_satisfaction_snapshot', '_hidden_lead_multiplier_snapshot',
+    '_hidden_arena_allocation_log', '_hidden_arena_money_transfer_applications',
+    '_hidden_arena_research_share_applications', '_hidden_arena_switching_log',
     'global_drift_state',
 }
 

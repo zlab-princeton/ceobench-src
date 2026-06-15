@@ -15,6 +15,7 @@ CLI and the ``novamind_api`` SDK source at ``docs/novamind_api/``.
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -192,6 +193,39 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
         sys.exit(1)
 
 
+def _arena_company_env() -> dict:
+    company_id = os.environ.get("CEOBENCH_ARENA_COMPANY_ID")
+    coordinator_port = os.environ.get("CEOBENCH_ARENA_COORDINATOR_PORT")
+    if not company_id or not coordinator_port:
+        return {}
+    return {
+        "company_id": company_id,
+        "display_name": os.environ.get("CEOBENCH_ARENA_DISPLAY_NAME") or company_id,
+        "coordinator_port": int(coordinator_port),
+    }
+
+
+def _register_arena_company_if_needed(port: int) -> None:
+    arena_env = _arena_company_env()
+    if not arena_env:
+        return
+    result = _api_call(
+        arena_env["coordinator_port"],
+        "POST",
+        "/arena-register-company",
+        {
+            "company_id": arena_env["company_id"],
+            "display_name": arena_env["display_name"],
+            "api_port": int(port),
+        },
+    )
+    if not result.get("success"):
+        print(
+            f"Warning: failed to register Arena company: {result.get('error', 'unknown_error')}",
+            file=sys.stderr,
+        )
+
+
 def _log_history(session_id: str, entry: dict):
     if session_id == "__env__":
         return
@@ -223,6 +257,7 @@ def cmd_new_session(args):
 def cmd_next_week(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
+    _register_arena_company_if_needed(port)
     rationale = (args.rationale or "").strip()
     if not rationale:
         print("Error: rationale is required and must be a non-empty string.", file=sys.stderr)
@@ -236,6 +271,39 @@ def cmd_next_week(args):
             "cash_26wk": {"point": float(args.cash_26wk_point), "lower": float(args.cash_26wk_lower), "upper": float(args.cash_26wk_upper)},
         }
     }
+
+    arena_env = _arena_company_env()
+    if arena_env:
+        status = _api_call(port, "GET", "/game-status")
+        result = _api_call(
+            arena_env["coordinator_port"],
+            "POST",
+            "/next-week",
+            {
+                "company_id": arena_env["company_id"],
+                "display_name": arena_env["display_name"],
+                "api_port": port,
+                "day": int(status.get("day", 0)),
+                **body,
+            },
+        )
+        if result.get("success"):
+            dashboard = result.get("dashboard", "")
+            print(dashboard)
+            _log_history(session_id, {
+                "type": "arena_next_week",
+                "day": result.get("day"),
+                "rationale": rationale,
+                "predictions": body["predictions"],
+                "timestamp": time.time(),
+            })
+            return
+
+        print(f"Error: {result.get('error', 'arena_next_week_failed')}", file=sys.stderr)
+        if result.get("message"):
+            print(result["message"], file=sys.stderr)
+        sys.exit(1)
+
     result = _api_call(port, "POST", "/next-week", body)
     if result.get("success"):
         dashboard = result.get("dashboard", "")
@@ -258,6 +326,7 @@ def cmd_next_week(args):
 def cmd_python(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
+    _register_arena_company_if_needed(port)
     script_path = Path(args.script)
     if not script_path.exists():
         print(f"Error: Script not found: {script_path}", file=sys.stderr)
@@ -269,6 +338,7 @@ def cmd_python(args):
 def cmd_python_c(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
+    _register_arena_company_if_needed(port)
     _execute_python(session_id, port, args.code, source="inline")
 
 
@@ -349,6 +419,9 @@ def cmd_query(args):
 
 def cmd_status(args):
     session_id = _resolve_session(args.session)
+    env_port = os.environ.get("NOVAMIND_API_PORT")
+    if env_port:
+        _register_arena_company_if_needed(int(env_port))
     if session_id == "__env__":
         real_id = args.session or _get_latest_session()
         if real_id:
@@ -373,6 +446,270 @@ def cmd_status(args):
     else:
         meta["server_running"] = False
     print(json.dumps(meta, indent=2))
+
+
+def _copy_public_bundle_to_company(company_dir: Path) -> None:
+    company_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("novamind-operation", "requirements.txt", "README.md", ".gitignore"):
+        src = _base_dir() / name
+        if src.exists():
+            shutil.copy2(src, company_dir / name)
+    docs_src = _base_dir() / "docs"
+    docs_dst = company_dir / "docs"
+    if docs_src.exists():
+        if docs_dst.exists():
+            shutil.rmtree(docs_dst)
+        shutil.copytree(docs_src, docs_dst, ignore=shutil.ignore_patterns("__pycache__"))
+
+
+def _write_arena_env(company_dir: Path, *, company_id: str, display_name: str, coordinator_port: int | None) -> None:
+    lines = [
+        f"export CEOBENCH_ARENA_COMPANY_ID={company_id!r}",
+        f"export CEOBENCH_ARENA_DISPLAY_NAME={display_name!r}",
+    ]
+    if coordinator_port is not None:
+        lines.append(f"export CEOBENCH_ARENA_COORDINATOR_PORT={int(coordinator_port)}")
+    else:
+        lines.append("# CEOBENCH_ARENA_COORDINATOR_PORT is written by arena-start")
+    (company_dir / "arena.env").write_text("\n".join(lines) + "\n")
+
+
+def _arena_dir(args) -> Path:
+    return Path(args.arena_dir).resolve()
+
+
+def cmd_arena_init(args):
+    from saas_bench.arena.company import make_company_specs
+
+    arena_dir = _arena_dir(args)
+    arena_dir.mkdir(parents=True, exist_ok=True)
+    companies_root = arena_dir / "companies"
+    companies_root.mkdir(exist_ok=True)
+
+    specs = make_company_specs(args.companies, starting_cash=args.cash)
+    company_entries = []
+    for index, spec in enumerate(specs):
+        company_dir = companies_root / spec.company_id
+        _copy_public_bundle_to_company(company_dir)
+        _write_arena_env(
+            company_dir,
+            company_id=spec.company_id,
+            display_name=spec.display_name,
+            coordinator_port=None,
+        )
+
+        session_result = subprocess.run(
+            [
+                sys.executable,
+                str(company_dir / "novamind-operation"),
+                "new-session",
+                "--days",
+                str(args.days),
+                "--seed",
+                str(args.seed + index),
+                "--cash",
+                str(args.cash),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(company_dir),
+        )
+        if session_result.returncode != 0:
+            print(session_result.stderr, file=sys.stderr, end="")
+            sys.exit(session_result.returncode)
+        try:
+            session_info = json.loads(session_result.stdout)
+        except json.JSONDecodeError:
+            session_info = {"raw": session_result.stdout.strip()}
+
+        company_entries.append({
+            "company_id": spec.company_id,
+            "display_name": spec.display_name,
+            "dir": str(company_dir),
+            "session": session_info,
+            "seed": args.seed + index,
+        })
+
+    config = {
+        "run_id": arena_dir.name,
+        "arena": True,
+        "company_count": args.companies,
+        "seed": args.seed,
+        "total_days": args.days,
+        "initial_cash": args.cash,
+        "companies": company_entries,
+    }
+    (arena_dir / "arena.json").write_text(json.dumps(config, indent=2))
+    print(json.dumps({"success": True, "arena_dir": str(arena_dir), "companies": company_entries}, indent=2))
+
+
+def _arena_process_alive(pid_file: Path) -> bool:
+    if not pid_file.exists():
+        return False
+    try:
+        os.kill(int(pid_file.read_text().strip()), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+
+
+def cmd_arena_start(args):
+    arena_dir = _arena_dir(args)
+    config_file = arena_dir / "arena.json"
+    if not config_file.exists():
+        print(f"Error: missing {config_file}; run arena-init first.", file=sys.stderr)
+        sys.exit(1)
+
+    pid_file = arena_dir / ".coordinator.pid"
+    port_file = arena_dir / ".coordinator.port"
+    if _arena_process_alive(pid_file) and port_file.exists():
+        port = int(port_file.read_text().strip())
+        _write_arena_envs_from_config(arena_dir, port)
+        print(json.dumps({"success": True, "arena_dir": str(arena_dir), "coordinator_port": port, "already_running": True}, indent=2))
+        return
+
+    log_path = arena_dir / "coordinator.log"
+    log_fd = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(_zipapp_path()),
+                "arena-coordinator",
+                "--arena-dir",
+                str(arena_dir),
+            ],
+            stdout=log_fd,
+            stderr=log_fd,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=str(arena_dir),
+        )
+    finally:
+        log_fd.close()
+
+    pid_file.write_text(str(proc.pid))
+    for _ in range(100):
+        time.sleep(0.1)
+        if port_file.exists():
+            port = int(port_file.read_text().strip())
+            _write_arena_envs_from_config(arena_dir, port)
+            print(json.dumps({"success": True, "arena_dir": str(arena_dir), "coordinator_port": port, "pid": proc.pid}, indent=2))
+            return
+
+    print(f"Error: Arena coordinator did not start. See {log_path}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _write_arena_envs_from_config(arena_dir: Path, coordinator_port: int) -> None:
+    config = json.loads((arena_dir / "arena.json").read_text())
+    for company in config.get("companies", []):
+        company_dir = Path(company["dir"])
+        _write_arena_env(
+            company_dir,
+            company_id=str(company["company_id"]),
+            display_name=str(company["display_name"]),
+            coordinator_port=coordinator_port,
+        )
+
+
+def cmd_arena_coordinator(args):
+    from saas_bench.agents.bash_agent.arena_runner import ArenaBashAgentRunner
+    from saas_bench.arena import ArenaCoordinatorHTTPServer, ArenaNextWeekCoordinator
+
+    arena_dir = _arena_dir(args)
+    config = json.loads((arena_dir / "arena.json").read_text())
+    runner = ArenaBashAgentRunner(
+        company_count=int(config["company_count"]),
+        seed=int(config.get("seed", 42)),
+        total_days=int(config.get("total_days", 365)),
+        initial_cash=float(config.get("initial_cash", 1_000_000.0)),
+        workspace_base=arena_dir,
+    )
+    company_ids = [company["company_id"] for company in config["companies"]]
+    coordinator = ArenaNextWeekCoordinator(
+        company_ids,
+        runner._advance_submitted_week,
+        acquisition_slot_callback=runner._advance_acquisition_slot,
+    )
+    runner._coordinator = coordinator
+    server = ArenaCoordinatorHTTPServer(coordinator)
+    server.start()
+    runner._active_coordinator_port = server.port
+    (arena_dir / ".coordinator.port").write_text(str(server.port))
+    _write_arena_envs_from_config(arena_dir, server.port)
+    print(json.dumps({"success": True, "coordinator_port": server.port}), flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+
+
+def cmd_arena_stop(args):
+    arena_dir = _arena_dir(args)
+    pid_file = arena_dir / ".coordinator.pid"
+    port_file = arena_dir / ".coordinator.port"
+    if not pid_file.exists():
+        print(json.dumps({"success": True, "message": "No Arena coordinator running"}))
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, ValueError):
+        pass
+    pid_file.unlink(missing_ok=True)
+    port_file.unlink(missing_ok=True)
+    print(json.dumps({"success": True}))
+
+
+def cmd_arena_retire(args):
+    company_id = args.company_id or os.environ.get("CEOBENCH_ARENA_COMPANY_ID")
+    if not company_id:
+        print(
+            "Error: --company-id is required unless CEOBENCH_ARENA_COMPANY_ID is set.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if args.arena_dir:
+        port_file = Path(args.arena_dir).resolve() / ".coordinator.port"
+        if not port_file.exists():
+            print(
+                f"Error: missing {port_file}; run arena-start first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        coordinator_port = int(port_file.read_text().strip())
+    else:
+        coordinator_port_raw = os.environ.get("CEOBENCH_ARENA_COORDINATOR_PORT")
+        if not coordinator_port_raw:
+            print(
+                "Error: --arena-dir is required unless CEOBENCH_ARENA_COORDINATOR_PORT is set.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        coordinator_port = int(coordinator_port_raw)
+
+    result = _api_call(
+        coordinator_port,
+        "POST",
+        "/arena-retire-company",
+        {
+            "company_id": company_id,
+            "outcome": args.outcome,
+        },
+    )
+    if result.get("success"):
+        print(json.dumps(result, indent=2))
+        return
+
+    print(f"Error: {result.get('error', 'arena_retire_failed')}", file=sys.stderr)
+    if result.get("message"):
+        print(result["message"], file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_history(args):
@@ -521,6 +858,27 @@ Examples:
     p = subparsers.add_parser("stop", help="Stop the simulation server")
     p.add_argument("--session", type=str, default=None, help="Session ID (default: latest)")
 
+    p = subparsers.add_parser("arena-init", help="Create an Arena directory with ordinary CEOBench company workspaces")
+    p.add_argument("--arena-dir", type=str, required=True, help="Output Arena directory")
+    p.add_argument("--companies", type=int, default=2, help="Number of companies")
+    p.add_argument("--days", type=int, default=500, help="Total simulation days")
+    p.add_argument("--seed", type=int, default=42, help="Base random seed")
+    p.add_argument("--cash", type=float, default=1_000_000.0, help="Initial cash per company")
+
+    p = subparsers.add_parser("arena-start", help="Start the Arena coordinator for an arena-init directory")
+    p.add_argument("--arena-dir", type=str, required=True, help="Arena directory")
+
+    p = subparsers.add_parser("arena-coordinator", help=argparse.SUPPRESS)
+    p.add_argument("--arena-dir", type=str, required=True, help=argparse.SUPPRESS)
+
+    p = subparsers.add_parser("arena-stop", help="Stop the Arena coordinator")
+    p.add_argument("--arena-dir", type=str, required=True, help="Arena directory")
+
+    p = subparsers.add_parser("arena-retire", help="Retire an Arena company from future barriers")
+    p.add_argument("--arena-dir", type=str, default=None, help="Arena directory")
+    p.add_argument("--company-id", type=str, default=None, help="Arena company id")
+    p.add_argument("--outcome", type=str, default="terminal", help="Terminal outcome label")
+
     args = parser.parse_args()
 
     cmd_map = {
@@ -533,6 +891,11 @@ Examples:
         "history": cmd_history,
         "list-sessions": cmd_list_sessions,
         "stop": cmd_stop,
+        "arena-init": cmd_arena_init,
+        "arena-start": cmd_arena_start,
+        "arena-coordinator": cmd_arena_coordinator,
+        "arena-stop": cmd_arena_stop,
+        "arena-retire": cmd_arena_retire,
     }
 
     cmd_map[args.command](args)

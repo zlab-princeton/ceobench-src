@@ -125,6 +125,9 @@ tests/*
 !tests/test_ceobench_initial_conditions.py
 !tests/test_ceobench_rnd_projects.py
 !tests/test_ceobench_segment_discovery.py
+!tests/test_arena_coordinator.py
+!tests/test_arena_interactions.py
+!tests/test_arena_shared_market.py
 tools/
 variants/
 viz/

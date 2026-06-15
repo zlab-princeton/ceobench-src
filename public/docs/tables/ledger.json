@@ -4,7 +4,7 @@
   "columns": {
     "id": "INTEGER PRIMARY KEY \u2014 Unique entry ID",
     "day": "INTEGER \u2014 Simulation day",
-    "category": "TEXT \u2014 Category: 'subscription_payment', 'compute', 'capacity', 'advertising', 'operations', 'development', 'lead_acquisition_cost', 'initial_funding', 'market_research', 'group_research', 'research_project'",
+    "category": "TEXT \u2014 Category: 'subscription_payment', 'compute', 'capacity', 'advertising', 'operations', 'development', 'lead_acquisition_cost', 'initial_funding', 'market_research', 'group_research', 'research_project', 'ad_revenue', 'arena_transfer_in', 'arena_transfer_out'",
     "amount": "REAL \u2014 Amount (positive=income, negative=expense)",
     "note": "TEXT \u2014 Description of the transaction"
   }

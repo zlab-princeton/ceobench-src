@@ -165,6 +165,12 @@ def _restore_simulator_llm_config(config: BenchmarkConfig, meta: dict) -> None:
             setattr(config, attr, value)
 
 
+def _apply_arena_server_overrides(config: BenchmarkConfig) -> None:
+    """Apply coordinator-owned Arena settings to ordinary company servers."""
+    if os.environ.get("CEOBENCH_ARENA_SHARED_COMPETITOR_EVENTS") == "1":
+        config.competitor_events_disabled = True
+
+
 def _create_simulator_openai_client(config: BenchmarkConfig):
     if (
         config.social_post_llm_provider != "openai"
@@ -197,6 +203,7 @@ def cmd_new_session(args, base: Path):
         total_days=total_days,
         initial_cash=args.cash,
     )
+    _apply_arena_server_overrides(config)
     simulator_llm = _apply_simulator_llm_config(config)
 
     # Initialize database in memory (never writes plain SQLite to disk)
@@ -287,6 +294,7 @@ def cmd_start_server(args, base: Path):
         initial_cash=meta["initial_cash"],
     )
     _restore_simulator_llm_config(config, meta)
+    _apply_arena_server_overrides(config)
     meta["simulator_llm"] = _apply_simulator_llm_config(config)
 
     customer_sim = CustomerSimulator(

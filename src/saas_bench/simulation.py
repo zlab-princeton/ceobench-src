@@ -5,7 +5,7 @@ import math
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 
 import numpy as np
 from numpy.random import Generator, PCG64
@@ -1485,7 +1485,7 @@ class Simulator:
         """, (customer_id,)).fetchone()
         return result is not None
 
-    def _create_subscription(self, customer_id: int, plan: str, price: float):
+    def _create_subscription(self, customer_id: int, plan: str, price: float, lead_channel: str = None):
         """Create a direct subscription for individual customers.
 
         Customer subscribes immediately if their participation curve accepts the plan.
@@ -1508,7 +1508,7 @@ class Simulator:
         daily_usage_rate = sample_daily_usage_rate(self.rng, usage_scale, seat_count)
 
         # Compute lead promotion for first billing period (new leads only)
-        lead_promo = self._get_lead_promotion(group_id)
+        lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
         # Also include any existing user promotion that applies
         existing_promo = self._get_effective_promotion(customer_id, group_id, plan)
         # Total first-period promotion = lead promo + existing promo
@@ -1855,6 +1855,969 @@ class Simulator:
 
         return cancellations, quality_cancellations, upgrades, downgrades, churn_events
 
+    def _empty_customer_generation_result(self) -> dict:
+        return {
+            'total_new': 0,
+            'total_leads': 0,
+            'new_individual_leads': 0,
+            'new_enterprise_leads': 0,
+            'new_individual_subscribers': 0,
+        }
+
+    def _json_safe_arena_value(self, value):
+        """Convert simulator/numpy values into JSON-native values for arena RPC."""
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): self._json_safe_arena_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe_arena_value(v) for v in value]
+        return value
+
+    def _draw_arena_hidden_hurdle(self, *, mean: float, std: float, max_value: float) -> float:
+        """Draw a non-negative hidden Arena choice-friction value."""
+        max_value = max(0.0, float(max_value))
+        if max_value <= 0.0:
+            return 0.0
+        mean = float(mean)
+        std = max(0.0, float(std))
+        if std == 0.0:
+            return clamp(mean, 0.0, max_value)
+        return clamp(float(self.rng.normal(mean, std)), 0.0, max_value)
+
+    def _draw_arena_comparison_hurdle(self) -> float:
+        return self._draw_arena_hidden_hurdle(
+            mean=self.config.arena_comparison_hurdle_mean,
+            std=self.config.arena_comparison_hurdle_std,
+            max_value=self.config.arena_comparison_hurdle_max,
+        )
+
+    def _draw_arena_switching_noise(self) -> float:
+        return self._draw_arena_hidden_hurdle(
+            mean=self.config.arena_switching_noise_mean,
+            std=self.config.arena_switching_noise_std,
+            max_value=self.config.arena_switching_noise_max,
+        )
+
+    def _arena_subscriber_counts_by_group(self) -> dict:
+        rows = self.conn.execute("""
+            SELECT c.group_id, COUNT(*) as cnt
+            FROM subscriptions s
+            JOIN customers c ON s.customer_id = c.customer_id
+            WHERE s.status = 'subscribed' AND s.end_day IS NULL
+            GROUP BY c.group_id
+        """).fetchall()
+        return {row['group_id']: int(row['cnt']) for row in rows}
+
+    def _compute_lead_exposure_by_group(
+        self,
+        config: dict,
+        *,
+        saturation_subscriber_counts_by_group: Optional[dict] = None,
+    ) -> dict:
+        """Compute CEOBench's per-group expected lead flow without sampling.
+
+        This is the first half of ``_generate_new_customers`` lifted for Arena:
+        ads, company-specific network effects, reputation, market saturation,
+        cycles, macro conditions, social-media influence, and demand surges all
+        remain the ordinary CEOBench mechanisms. Arena may pass total market
+        subscribers for saturation while each company still gets network effects
+        from its own subscribers.
+        """
+        from .config import AD_CHANNELS
+
+        discovered_group_ids = set(get_discovered_groups(self.conn))
+        active_groups = {gid: g for gid, g in CUSTOMER_GROUPS.items() if gid in discovered_group_ids}
+        group_reps = get_all_group_reputations(self.conn)
+        own_subs_per_group = self._arena_subscriber_counts_by_group()
+        saturation_subs_per_group = (
+            {str(k): int(v) for k, v in saturation_subscriber_counts_by_group.items()}
+            if saturation_subscriber_counts_by_group is not None
+            else own_subs_per_group
+        )
+
+        channel_leads = {g: {} for g in active_groups}
+        for channel_id, channel in AD_CHANNELS.items():
+            channel_targets = self.config.targeted_ad_spend.get(channel_id, {})
+            for group_id, spend in channel_targets.items():
+                if spend <= 0 or group_id not in active_groups:
+                    continue
+                leads_per_1k = channel.leads_per_1000_dollars.get(group_id)
+                if leads_per_1k is None:
+                    continue
+                expected_leads = spend * leads_per_1k / 1000.0
+                if expected_leads > 0:
+                    channel_leads[group_id][channel_id] = expected_leads
+
+        exposures = {}
+        for group_id, group in active_groups.items():
+            rep = group_reps.get(group_id, 0.5)
+            reputation_factor = rep
+
+            group_channel_leads = channel_leads.get(group_id, {})
+            total_channel_leads = sum(group_channel_leads.values())
+
+            network_leads = 0.0
+            for source_group_id in active_groups:
+                source_subs = own_subs_per_group.get(source_group_id, 0)
+                if source_subs <= 0:
+                    continue
+                rate = NETWORK_INFLUENCE_MATRIX.get(source_group_id, {}).get(group_id, 0.0)
+                if rate > 0:
+                    network_leads += source_subs * rate
+
+            current_market_subs = saturation_subs_per_group.get(group_id, 0)
+            market_cap_t = group.base_market_cap * (1 + group.annual_cap_growth_rate * self.current_day / 365.0)
+            if market_cap_t > 0 and current_market_subs > 0:
+                saturation_ratio = current_market_subs / market_cap_t
+                demand_multiplier = max(0.0, 1.0 - saturation_ratio ** 2)
+            else:
+                demand_multiplier = 1.0
+
+            weekly_mult, monthly_mult = self._get_cycle_multipliers(self.current_day)
+            cycle_mult = weekly_mult * monthly_mult
+            macro_lead_mult = self.get_macro_multiplier(group_id, 'lead_generation')
+            social_media_mult = compute_social_media_multiplier(self.conn, self.current_day, group_id)
+            surge_mult = self._get_surge_lead_multiplier()
+
+            daily_leads = (
+                reputation_factor
+                * demand_multiplier
+                * cycle_mult
+                * macro_lead_mult
+                * social_media_mult
+                * surge_mult
+                * (total_channel_leads + network_leads)
+            )
+
+            acquisition_weights = {
+                ch_id: float(leads)
+                for ch_id, leads in group_channel_leads.items()
+                if leads > 0
+            }
+            if network_leads > 0:
+                acquisition_weights['network'] = float(network_leads)
+
+            exposures[group_id] = {
+                'expected_leads': float(max(0.0, daily_leads)),
+                'acquisition_weights': acquisition_weights,
+                'components': {
+                    'reputation_factor': float(reputation_factor),
+                    'demand_multiplier': float(demand_multiplier),
+                    'cycle_mult': float(cycle_mult),
+                    'macro_lead_mult': float(macro_lead_mult),
+                    'social_media_mult': float(social_media_mult),
+                    'surge_mult': float(surge_mult),
+                    'total_channel_leads': float(total_channel_leads),
+                    'network_leads': float(network_leads),
+                },
+            }
+        return exposures
+
+    def arena_market_state(
+        self,
+        *,
+        company_id: str,
+        display_name: str,
+        market_subscriber_counts_by_group: Optional[dict] = None,
+    ) -> dict:
+        """Return the hidden company state the Arena coordinator needs."""
+        config = self.get_current_config()
+        self._cache_step_day_globals(config)
+        own_subs = self._arena_subscriber_counts_by_group()
+        exposures = self._compute_lead_exposure_by_group(
+            config,
+            saturation_subscriber_counts_by_group=market_subscriber_counts_by_group,
+        )
+        group_ids = sorted(exposures)
+        state = {
+            'company_id': company_id,
+            'display_name': display_name,
+            'day': int(self.current_day),
+            'config': dict(config),
+            'base_product_quality': float(self.config.base_product_quality),
+            'q_shared_bonus': float(self._cached_q_shared_bonus),
+            'q_group_bonuses': {
+                gid: float(self._cached_q_group_bonus.get(gid, 0.0))
+                for gid in group_ids
+            },
+            'lead_promotions_by_group': {
+                gid: float(self._get_lead_promotion(gid))
+                for gid in group_ids
+            },
+            'subscriber_counts_by_group': own_subs,
+            'exposures_by_group': exposures,
+        }
+        return self._json_safe_arena_value(state)
+
+    def arena_upsert_public_market_snapshots(self, snapshots: List[dict]) -> dict:
+        """Store Arena public competitor snapshots in this company's DB."""
+        rows = []
+        for snapshot in snapshots:
+            config = dict(snapshot.get('config') or {})
+            try:
+                day = int(snapshot.get('day', self.current_day))
+            except (TypeError, ValueError):
+                day = int(self.current_day)
+            rows.append((
+                day,
+                str(snapshot.get('company_id') or ''),
+                str(snapshot.get('display_name') or snapshot.get('company_id') or ''),
+                float(config.get('price_A', 0.0)),
+                float(config.get('price_B', 0.0)),
+                float(config.get('price_C', 0.0)),
+                int(config.get('tier_A', 1)),
+                int(config.get('tier_B', 1)),
+                int(config.get('tier_C', 1)),
+            ))
+
+        if rows:
+            self.conn.executemany(
+                """
+                INSERT OR REPLACE INTO arena_public_market_snapshots (
+                    day, company_id, display_name,
+                    price_A, price_B, price_C,
+                    tier_A, tier_B, tier_C
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            self.conn.commit()
+        return {"snapshots_written": len(rows)}
+
+    def arena_apply_money_transfer(
+        self,
+        *,
+        transfer_id: str,
+        direction: str,
+        counterparty_company_id: str,
+        amount: float,
+        day: Optional[int] = None,
+        memo: str = "",
+    ) -> dict:
+        """Apply one idempotent Arena money-transfer ledger effect."""
+
+        transfer_id = str(transfer_id).strip()
+        direction = str(direction).strip()
+        counterparty_company_id = str(counterparty_company_id).strip()
+        amount = float(amount)
+        day = self.current_day if day is None else int(day)
+        memo = str(memo or "")
+
+        if not transfer_id:
+            return {"success": False, "error": "missing_transfer_id"}
+        if direction not in {"in", "out"}:
+            return {"success": False, "error": "invalid_transfer_direction"}
+        if not counterparty_company_id:
+            return {"success": False, "error": "missing_counterparty_company_id"}
+        if amount <= 0:
+            return {"success": False, "error": "invalid_transfer_amount"}
+
+        existing = self.conn.execute(
+            """
+            SELECT transfer_id
+            FROM _hidden_arena_money_transfer_applications
+            WHERE transfer_id = ?
+            """,
+            (transfer_id,),
+        ).fetchone()
+        if existing:
+            return {"success": True, "transfer_id": transfer_id, "applied": False}
+
+        if direction == "out" and get_cash(self.conn) < amount:
+            return {
+                "success": False,
+                "error": "insufficient_cash",
+                "message": f"Cash balance is below transfer amount ${amount:,.2f}.",
+            }
+
+        signed_amount = amount if direction == "in" else -amount
+        category = "arena_transfer_in" if direction == "in" else "arena_transfer_out"
+        note = f"Arena transfer {transfer_id} with {counterparty_company_id}"
+        if memo:
+            note = f"{note}: {memo}"
+
+        add_ledger_entry(self.conn, day, category, signed_amount, note)
+        self.conn.execute(
+            """
+            INSERT INTO _hidden_arena_money_transfer_applications
+                (transfer_id, day, direction, counterparty_company_id, amount, memo)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (transfer_id, day, direction, counterparty_company_id, amount, memo),
+        )
+        self.conn.commit()
+        return {"success": True, "transfer_id": transfer_id, "applied": True}
+
+    def arena_research_share_snapshot(self, *, group_id: str) -> dict:
+        """Return the sender's bounded shareable research state for a group."""
+
+        group_id = str(group_id).strip()
+        if not group_id:
+            return {"success": False, "error": "missing_group_id"}
+        from .database import get_group_info_level
+
+        return {
+            "success": True,
+            "group_id": group_id,
+            "info_level": get_group_info_level(self.conn, group_id),
+        }
+
+    def arena_apply_research_share(
+        self,
+        *,
+        share_id: str,
+        sender_company_id: str,
+        group_id: str,
+        source_info_level: int,
+        day: Optional[int] = None,
+        memo: str = "",
+    ) -> dict:
+        """Apply a bounded Arena research-share credit.
+
+        A recipient can move at most one group-info level toward the sender's
+        current level. This deliberately affects market knowledge only, not
+        product quality.
+        """
+
+        share_id = str(share_id).strip()
+        sender_company_id = str(sender_company_id).strip()
+        group_id = str(group_id).strip()
+        source_info_level = int(source_info_level)
+        day = self.current_day if day is None else int(day)
+        memo = str(memo or "")
+
+        if not share_id:
+            return {"success": False, "error": "missing_share_id"}
+        if not sender_company_id:
+            return {"success": False, "error": "missing_sender_company_id"}
+        if not group_id:
+            return {"success": False, "error": "missing_group_id"}
+
+        existing = self.conn.execute(
+            """
+            SELECT share_id, old_info_level, new_info_level
+            FROM _hidden_arena_research_share_applications
+            WHERE share_id = ?
+            """,
+            (share_id,),
+        ).fetchone()
+        if existing:
+            return {
+                "success": True,
+                "share_id": share_id,
+                "applied": False,
+                "old_info_level": int(existing["old_info_level"]),
+                "new_info_level": int(existing["new_info_level"]),
+            }
+
+        from .database import get_group_info_level, set_group_info_level
+
+        old_level = get_group_info_level(self.conn, group_id)
+        target_level = old_level
+        if source_info_level > old_level:
+            target_level = min(source_info_level, old_level + 1, 5)
+            set_group_info_level(self.conn, group_id, target_level, day)
+
+        self.conn.execute(
+            """
+            INSERT INTO _hidden_arena_research_share_applications
+                (share_id, day, sender_company_id, group_id,
+                 source_info_level, old_info_level, new_info_level, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                share_id,
+                day,
+                sender_company_id,
+                group_id,
+                source_info_level,
+                old_level,
+                target_level,
+                memo,
+            ),
+        )
+        self.conn.commit()
+        return {
+            "success": True,
+            "share_id": share_id,
+            "applied": target_level > old_level,
+            "old_info_level": old_level,
+            "new_info_level": target_level,
+        }
+
+    def arena_generate_lead_params(self, group_id: str, acquisition_weights: Optional[dict] = None) -> dict:
+        """Sample one customer profile for Arena without inserting it."""
+        config = self.get_current_config()
+        self._cache_step_day_globals(config)
+        params = self._generate_customer_from_group(group_id)
+
+        weights = {
+            str(k): float(v)
+            for k, v in (acquisition_weights or {}).items()
+            if float(v) > 0
+        }
+        if weights:
+            source_names = list(weights.keys())
+            total_weight = sum(weights.values())
+            probabilities = [weights[name] / total_weight for name in source_names]
+            acquisition_source = str(self.rng.choice(source_names, p=probabilities))
+        else:
+            acquisition_source = 'organic'
+
+        params['acquisition_source'] = acquisition_source
+        params['_lead_channel'] = acquisition_source if acquisition_source not in ('organic', 'network') else None
+        params['_arena_comparison_hurdle'] = self._draw_arena_comparison_hurdle()
+        if params.get('customer_type') != 'large':
+            params['_arena_quality_noise'] = self._draw_anonymous_quality_noise()
+        return self._json_safe_arena_value(params)
+
+    def arena_evaluate_lead_offers(
+        self,
+        params: dict,
+        *,
+        company_id: str,
+        display_name: str,
+    ) -> dict:
+        """Evaluate one Arena lead against this company's A/B/C plans.
+
+        This is the multi-company analogue of CEOBench's new-customer
+        quality-price decision. The coordinator owns consideration sets and
+        cross-company choice; each company owns its own offer quality, price,
+        promotions, quotas, and current research state.
+        """
+        config = self.get_current_config()
+        self._cache_step_day_globals(config)
+        offers = [
+            self._arena_evaluate_lead_plan_offer(
+                params,
+                config,
+                plan,
+                company_id=company_id,
+                display_name=display_name,
+            )
+            for plan in ('A', 'B', 'C')
+        ]
+        return self._json_safe_arena_value({"offers": offers})
+
+    def _evaluate_lead_plan_offer_terms(
+        self,
+        params: dict,
+        config: dict,
+        plan: str,
+        *,
+        company_id: str = "",
+        display_name: str = "",
+        quality_noise: float | None = None,
+    ) -> dict:
+        """Evaluate one new-lead offer using CEOBench quality-price mechanics."""
+
+        group_id = params.get('group_id', 'S1')
+        steepness_left = float(params.get('steepness_left', 1.0))
+        steepness_right = float(params.get('steepness_right', 2.0))
+        c_max = float(params.get('c_max', 100.0))
+        q_max = float(params.get('q_max', 0.75))
+        q_min = float(params.get('q_min', 0.25))
+
+        price = float(config[f'price_{plan}'])
+        lead_channel = params.get('_lead_channel')
+        lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
+        effective_price = max(0.0, price - lead_promo)
+
+        q_group_bonus = self._cached_q_group_bonus.get(group_id, 0.0) if self._cached_q_group_bonus else 0.0
+        product_quality = self.config.base_product_quality + self._cached_q_shared_bonus + q_group_bonus
+        tier = config[f'tier_{plan}']
+        tier_multiplier = MODEL_TIERS[tier].quality_multiplier
+        delivered_quality = product_quality * tier_multiplier
+
+        usage_demand = float(params.get('usage_demand', 50.0) or 50.0)
+        seat_count = int(params.get('seat_count', 1) or 1)
+        projected_monthly_usage = usage_demand * seat_count * 30
+        plan_quota = float(config.get(f'quota_{plan}', 100) or 100)
+
+        quota_penalty = 0.0
+        if projected_monthly_usage > plan_quota and projected_monthly_usage > 0:
+            fulfillment_ratio = plan_quota / projected_monthly_usage
+            quota_penalty = self.config.quota_dissatisfaction_scale * (1.0 - fulfillment_ratio)
+
+        perceived_quality = delivered_quality - quota_penalty
+        if quality_noise is None:
+            try:
+                quality_noise = float(params.get('_arena_quality_noise', 1.0) or 1.0)
+            except (TypeError, ValueError):
+                quality_noise = 1.0
+        if params.get('customer_type') != 'large':
+            perceived_quality *= float(quality_noise)
+        else:
+            quality_noise = 1.0
+
+        required_quality = self._compute_required_quality(
+            effective_price,
+            steepness_left,
+            steepness_right,
+            c_max,
+            q_max,
+            q_min,
+        )
+        satisfaction = perceived_quality - required_quality
+        acceptable = effective_price <= c_max and satisfaction >= 0.0
+
+        return {
+            'company_id': company_id,
+            'display_name': display_name,
+            'plan': plan,
+            'price': price,
+            'effective_price': effective_price,
+            'lead_promotion': float(lead_promo),
+            'tier': int(tier),
+            'delivered_quality': float(delivered_quality),
+            'q_shared_bonus': float(self._cached_q_shared_bonus),
+            'q_group_bonus': float(q_group_bonus),
+            'quota_penalty': float(quota_penalty),
+            'quality_noise': float(quality_noise),
+            'perceived_quality': float(perceived_quality),
+            'required_quality': float(required_quality),
+            'satisfaction': float(satisfaction),
+            'acceptable': bool(acceptable),
+        }
+
+    def _arena_evaluate_lead_plan_offer(
+        self,
+        params: dict,
+        config: dict,
+        plan: str,
+        *,
+        company_id: str,
+        display_name: str,
+    ) -> dict:
+        return self._evaluate_lead_plan_offer_terms(
+            params,
+            config,
+            plan,
+            company_id=company_id,
+            display_name=display_name,
+        )
+
+    def _record_arena_ad_spend_rows(self) -> None:
+        """Mirror CEOBench ad-channel spend logging for Arena acquisition."""
+        from .config import AD_CHANNELS
+
+        discovered_group_ids = set(get_discovered_groups(self.conn))
+        for channel_id, channel in AD_CHANNELS.items():
+            channel_targets = self.config.targeted_ad_spend.get(channel_id, {})
+            for group_id, spend in channel_targets.items():
+                try:
+                    spend_value = float(spend)
+                except (TypeError, ValueError):
+                    continue
+                if spend_value <= 0:
+                    continue
+                if group_id not in discovered_group_ids:
+                    continue
+                if channel.leads_per_1000_dollars.get(group_id) is None:
+                    continue
+
+                existing = self.conn.execute(
+                    """
+                    SELECT id FROM ad_channel_leads
+                    WHERE day = ? AND channel_id = ? AND group_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (self.current_day, channel_id, group_id),
+                ).fetchone()
+                if existing:
+                    self.conn.execute(
+                        "UPDATE ad_channel_leads SET spend = ? WHERE id = ?",
+                        (spend_value, existing["id"]),
+                    )
+                    continue
+
+                self.conn.execute(
+                    """
+                    INSERT INTO ad_channel_leads
+                        (day, channel_id, group_id, leads_generated, spend)
+                    VALUES (?, ?, ?, 0, ?)
+                    """,
+                    (self.current_day, channel_id, group_id, spend_value),
+                )
+
+    def _update_arena_ad_channel_leads(self, actual_channel_leads: dict) -> None:
+        """Add actual Arena attributed leads to the day's ad-channel rows."""
+        for (channel_id, group_id), count in actual_channel_leads.items():
+            if count <= 0:
+                continue
+            row = self.conn.execute(
+                """
+                SELECT id FROM ad_channel_leads
+                WHERE day = ? AND channel_id = ? AND group_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (self.current_day, channel_id, group_id),
+            ).fetchone()
+            if row:
+                self.conn.execute(
+                    """
+                    UPDATE ad_channel_leads
+                    SET leads_generated = leads_generated + ?
+                    WHERE id = ?
+                    """,
+                    (int(count), row["id"]),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    INSERT INTO ad_channel_leads
+                        (day, channel_id, group_id, leads_generated, spend)
+                    VALUES (?, ?, ?, ?, 0.0)
+                    """,
+                    (self.current_day, channel_id, group_id, int(count)),
+                )
+
+    def arena_insert_allocated_leads(
+        self,
+        lead_specs: List[dict],
+        *,
+        target_company_id: Optional[str] = None,
+    ) -> dict:
+        """Insert shared-market Arena lead outcomes into this company's DB."""
+        self._cache_step_day_globals(self.get_current_config())
+        self._record_arena_ad_spend_rows()
+        result = self._empty_customer_generation_result()
+        if not lead_specs:
+            self.conn.commit()
+            return result
+
+        lead_cost = -self.config.lead_acquisition_cost
+        actual_channel_leads = {}
+        for spec in lead_specs:
+            params = dict(spec.get('params') or {})
+            source_company_id = str(spec.get('source_company_id') or '')
+            target_id = str(target_company_id or spec.get('target_company_id') or '')
+            own_sourced_lead = (
+                not source_company_id
+                or not target_id
+                or source_company_id == target_id
+            )
+            customer_params = dict(params)
+            if not own_sourced_lead:
+                customer_params['_lead_channel'] = None
+                customer_params['acquisition_source'] = 'arena_consideration'
+            lead_channel = customer_params.get('_lead_channel')
+            if own_sourced_lead and lead_channel not in (None, '', 'organic', 'network'):
+                group_id = str(customer_params.get('group_id', 'S1'))
+                key = (str(lead_channel), group_id)
+                actual_channel_leads[key] = actual_channel_leads.get(key, 0) + 1
+
+            outcome = str(spec.get('outcome') or 'lost')
+            plan = str(spec.get('plan') or 'A')
+            chosen_offer = dict(spec.get('chosen_offer') or {})
+            try:
+                price = float(spec.get('price'))
+            except (TypeError, ValueError):
+                current_config = self.get_current_config()
+                price = float(current_config.get(f'price_{plan}', current_config.get('price_A', 0.0)))
+
+            customer_id = self._create_customer(customer_params)
+            self.conn.execute(
+                "INSERT INTO ledger (day, category, amount, note) VALUES (?, ?, ?, ?)",
+                (
+                    self.current_day,
+                    'lead_acquisition_cost',
+                    lead_cost,
+                    f'Arena shared-market lead acquisition cost for customer {customer_id}',
+                ),
+            )
+            result['total_leads'] += 1
+            self._record_arena_allocation(
+                spec=spec,
+                params=params,
+                customer_id=customer_id,
+                outcome=outcome,
+                plan=plan,
+                listed_price=price,
+                chosen_offer=chosen_offer,
+                target_company_id=target_company_id,
+            )
+
+            if outcome == 'enterprise':
+                self._create_enterprise_lead(customer_id, customer_params)
+                result['new_enterprise_leads'] += 1
+                result['total_new'] += 1
+            elif outcome == 'enterprise_skip':
+                continue
+            elif outcome == 'subscribe':
+                self._create_subscription(
+                    customer_id,
+                    plan,
+                    price,
+                    lead_channel=customer_params.get('_lead_channel'),
+                )
+                result['new_individual_leads'] += 1
+                result['new_individual_subscribers'] += 1
+                result['total_new'] += 1
+            else:
+                self._create_lost_lead_record(customer_id, plan, price)
+                result['new_individual_leads'] += 1
+
+        self._update_arena_ad_channel_leads(actual_channel_leads)
+        self.conn.commit()
+        return result
+
+    def arena_switching_candidates(
+        self,
+        *,
+        company_id: str,
+        limit: int = 25,
+    ) -> dict:
+        """Return active individual renewal customers eligible to compare rivals."""
+
+        billing_day = self.current_day % 30
+        rows = self.conn.execute(
+            """
+            SELECT s.subscription_id, s.customer_id, s.plan, s.listed_price,
+                   s.start_day, s.daily_usage_rate, s.seat_count,
+                   c.customer_type, c.group_id,
+                   c.steepness_left, c.steepness_right, c.c_max,
+                   c.usage_scale, c.usage_demand,
+                   c.quality_sensitivity, c.price_sensitivity,
+                   c.willingness_to_pay, c.patience,
+                   c.reply_delay_mean, c.reply_delay_std,
+                   c.negotiation_rate, c.initial_offer_factor,
+                   c.max_negotiation_turns, c.contract_lockin_penalty,
+                   c.ads_quality_sensitivity, c.ads_return_sensitivity,
+                   COALESCE(cs.current_steepness_left, c.steepness_left) AS current_steepness_left,
+	                   COALESCE(cs.current_steepness_right, c.steepness_right) AS current_steepness_right,
+	                   COALESCE(cs.current_c_max, c.c_max) AS current_c_max,
+	                   COALESCE(cs.current_q_max, c.q_max) AS current_q_max,
+	                   COALESCE(cs.current_q_min, c.q_min) AS current_q_min,
+	                   cs.relationship AS relationship,
+	                   cs.satisfaction AS current_satisfaction
+            FROM subscriptions s
+            JOIN customers c ON s.customer_id = c.customer_id
+            JOIN customer_state cs ON c.customer_id = cs.customer_id
+            WHERE s.status = 'subscribed'
+              AND s.end_day IS NULL
+              AND s.billing_day_mod30 = ?
+              AND c.customer_type = 'small'
+            ORDER BY s.subscription_id
+            LIMIT ?
+            """,
+            (billing_day, max(0, int(limit))),
+        ).fetchall()
+
+        candidates = []
+        for row in rows:
+            params = {
+                "customer_type": "small",
+                "group_id": row["group_id"],
+                "steepness_left": row["current_steepness_left"],
+                "steepness_right": row["current_steepness_right"],
+                "c_max": row["current_c_max"],
+                "q_max": row["current_q_max"],
+                "q_min": row["current_q_min"],
+                "usage_scale": row["usage_scale"],
+                "usage_demand": row["usage_demand"],
+                "quality_sensitivity": row["quality_sensitivity"],
+                "price_sensitivity": row["price_sensitivity"],
+                "willingness_to_pay": row["willingness_to_pay"],
+                "patience": row["patience"],
+                "seat_count": row["seat_count"],
+                "contract_lockin_penalty": row["contract_lockin_penalty"],
+                "ads_quality_sensitivity": row["ads_quality_sensitivity"],
+                "ads_return_sensitivity": row["ads_return_sensitivity"],
+                "acquisition_source": "arena_switch",
+                "_lead_channel": None,
+                "_arena_quality_noise": 1.0,
+            }
+            contract_lockin_penalty = float(row["contract_lockin_penalty"] or 0.0)
+            relationship = float(row["relationship"] or 0.5)
+            relationship_inertia = (
+                max(0.0, relationship - 0.5)
+                * float(self.config.arena_relationship_inertia_scale)
+            )
+            switching_hurdle = (
+                contract_lockin_penalty
+                + relationship_inertia
+                + self._draw_arena_switching_noise()
+            )
+            candidates.append({
+                "switch_id": f"{company_id}:{row['subscription_id']}:{self.current_day}",
+                "source_company_id": company_id,
+                "source_customer_id": int(row["customer_id"]),
+                "source_subscription_id": int(row["subscription_id"]),
+                "group_id": row["group_id"],
+                "current_plan": row["plan"],
+                "current_price": float(row["listed_price"]),
+                "current_satisfaction": float(row["current_satisfaction"] or 0.0),
+                "switching_hurdle": float(switching_hurdle),
+                "params": params,
+            })
+        return self._json_safe_arena_value({"candidates": candidates})
+
+    def arena_insert_switched_customer(self, switch_spec: dict) -> dict:
+        """Insert a customer who switched from another Arena company."""
+
+        switch_id = str(switch_spec.get("switch_id") or "")
+        if not switch_id:
+            return {"success": False, "error": "missing_switch_id"}
+        existing = self.conn.execute(
+            "SELECT target_customer_id FROM _hidden_arena_switching_log WHERE switch_id = ?",
+            (switch_id,),
+        ).fetchone()
+        if existing:
+            return {
+                "success": True,
+                "switch_id": switch_id,
+                "target_customer_id": existing["target_customer_id"],
+                "applied": False,
+            }
+
+        params = dict(switch_spec.get("params") or {})
+        chosen_offer = dict(switch_spec.get("chosen_offer") or {})
+        plan = str(chosen_offer.get("plan") or switch_spec.get("plan") or "A")
+        price = float(chosen_offer.get("price", switch_spec.get("price", 0.0)) or 0.0)
+        customer_id = self._create_customer(params)
+        self._create_subscription(
+            customer_id,
+            plan,
+            price,
+            lead_channel=None,
+        )
+        self.conn.execute(
+            """
+            INSERT INTO _hidden_arena_switching_log (
+                switch_id, day, source_company_id, target_company_id,
+                source_customer_id, source_subscription_id, target_customer_id,
+                group_id, old_plan, new_plan, old_satisfaction,
+                new_satisfaction, chosen_offer_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                switch_id,
+                self.current_day,
+                str(switch_spec.get("source_company_id") or ""),
+                str(switch_spec.get("target_company_id") or ""),
+                int(switch_spec.get("source_customer_id") or 0),
+                int(switch_spec.get("source_subscription_id") or 0),
+                customer_id,
+                str(params.get("group_id") or ""),
+                str(switch_spec.get("current_plan") or ""),
+                plan,
+                float(switch_spec.get("current_satisfaction", 0.0) or 0.0),
+                float(chosen_offer.get("satisfaction", 0.0) or 0.0),
+                json.dumps(chosen_offer),
+            ),
+        )
+        self.conn.commit()
+        return {
+            "success": True,
+            "switch_id": switch_id,
+            "target_customer_id": customer_id,
+            "applied": True,
+        }
+
+    def arena_cancel_switched_customer(self, switch_spec: dict) -> dict:
+        """Cancel the source subscription after a successful Arena switch."""
+
+        subscription_id = int(switch_spec.get("source_subscription_id") or 0)
+        if subscription_id <= 0:
+            return {"success": False, "error": "missing_source_subscription_id"}
+        row = self.conn.execute(
+            """
+            SELECT status, end_day
+            FROM subscriptions
+            WHERE subscription_id = ?
+            """,
+            (subscription_id,),
+        ).fetchone()
+        if row is None:
+            return {"success": False, "error": "source_subscription_not_found"}
+        if row["status"] != "subscribed" or row["end_day"] is not None:
+            return {"success": True, "applied": False}
+
+        self.conn.execute(
+            """
+            UPDATE subscriptions
+            SET status = 'cancelled', end_day = ?, churn_reason = ?
+            WHERE subscription_id = ?
+            """,
+            (self.current_day, "competitive_switch", subscription_id),
+        )
+        self.conn.commit()
+        return {"success": True, "applied": True}
+
+    def _record_arena_allocation(
+        self,
+        *,
+        spec: dict,
+        params: dict,
+        customer_id: int,
+        outcome: str,
+        plan: str,
+        listed_price: float,
+        chosen_offer: dict,
+        target_company_id: Optional[str],
+    ) -> None:
+        def _float_or_none(value):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        source_company_id = str(spec.get('source_company_id') or '')
+        target_id = str(
+            spec.get('target_company_id')
+            or target_company_id
+            or ''
+        ) or None
+        chosen_company_id = spec.get('chosen_company_id')
+        if chosen_company_id is not None:
+            chosen_company_id = str(chosen_company_id)
+        recorded_chosen_offer = dict(chosen_offer)
+        arena_metadata = {
+            key: spec[key]
+            for key in ("arena_competitive_rfp", "arena_rfp_id")
+            if key in spec
+        }
+        if arena_metadata:
+            recorded_chosen_offer["_arena_allocation"] = arena_metadata
+
+        self.conn.execute(
+            """
+            INSERT INTO _hidden_arena_allocation_log (
+                day, customer_id, group_id, customer_type,
+                source_company_id, target_company_id, chosen_company_id,
+                outcome, plan, listed_price, effective_price, satisfaction,
+                perceived_quality, required_quality, consideration_set_json,
+                chosen_offer_json, offers_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.current_day,
+                customer_id,
+                str(params.get('group_id', '')),
+                str(params.get('customer_type', '')),
+                source_company_id,
+                target_id,
+                chosen_company_id,
+                outcome,
+                plan,
+                listed_price,
+                _float_or_none(chosen_offer.get('effective_price')),
+                _float_or_none(chosen_offer.get('satisfaction')),
+                _float_or_none(chosen_offer.get('perceived_quality')),
+                _float_or_none(chosen_offer.get('required_quality')),
+                json.dumps(spec.get('consideration_set') or []),
+                json.dumps(recorded_chosen_offer),
+                json.dumps(spec.get('offers') or []),
+            ),
+        )
+
     def _generate_new_customers(self, config: dict) -> dict:
         """Generate new customers using a simple, interpretable growth model per group.
 
@@ -2069,44 +3032,22 @@ class Simulator:
                 lead_channel = acquisition_source if acquisition_source not in ('organic', 'network') else None
                 params['_lead_channel'] = lead_channel
                 best_plan = self._choose_plan_for_customer_curve(params, config)
-                price = config[f'price_{best_plan}']
-
-                steepness_left = params.get('steepness_left', 1.0)
-                steepness_right = params.get('steepness_right', 2.0)
-                c_max = params.get('c_max', 100.0)
-                q_max = params.get('q_max', 0.75)
-                q_min = params.get('q_min', 0.25)
-
-                lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
-                effective_price = max(0.0, price - lead_promo)
-
-                tier = config[f'tier_{best_plan}']
-                tier_multiplier = MODEL_TIERS[tier].quality_multiplier
-                base_quality = product_quality * tier_multiplier
-
-                usage_demand = params.get('usage_demand', 50.0)
-                seat_count = int(params.get('seat_count', 1) or 1)
-                projected_monthly_usage = usage_demand * seat_count * 30
-                plan_quota = config.get(f'quota_{best_plan}', 100)
-
-                quota_penalty = 0.0
-                if projected_monthly_usage > plan_quota:
-                    fulfillment_ratio = plan_quota / projected_monthly_usage
-                    quota_penalty = self.config.quota_dissatisfaction_scale * (1.0 - fulfillment_ratio)
-
-                quality = base_quality - quota_penalty
 
                 # Initial-decision perceived-quality noise (individual customers only).
                 # Enterprise customers receive their noise during negotiation evaluations,
                 # not here, because their qualification gate below uses raw quality and
                 # they are inserted as DB rows before negotiation begins.
+                quality_noise = 1.0
                 if not _is_enterprise:
-                    quality *= self._draw_anonymous_quality_noise()
-
-                is_acceptable = self._plan_acceptable(
-                    steepness_left, steepness_right, c_max,
-                    quality, effective_price, q_max, q_min
+                    quality_noise = self._draw_anonymous_quality_noise()
+                selected_offer = self._evaluate_lead_plan_offer_terms(
+                    params,
+                    config,
+                    best_plan,
+                    quality_noise=quality_noise,
                 )
+                price = selected_offer['price']
+                is_acceptable = bool(selected_offer['acceptable'])
 
                 if _is_enterprise:
                     # Quality gate check (pure Python)
@@ -5586,6 +6527,124 @@ Requirements:
                 self.conn, seg_bank_key, max(0.0, seg_unreleased - seg_drain)
             )
 
+    def arena_apply_shared_competitor_event(self, event: dict) -> dict:
+        """Apply one coordinator-sampled Arena market expectation shock."""
+        if not isinstance(event, dict) or not event:
+            return {"success": True, "applied": False}
+
+        start_day = int(event.get("start_day", self.current_day + 1))
+        existing = self.conn.execute(
+            "SELECT event_id FROM competitor_events WHERE start_day = ? LIMIT 1",
+            (start_day,),
+        ).fetchone()
+        if existing:
+            return {
+                "success": True,
+                "applied": False,
+                "start_day": start_day,
+                "event_id": int(existing["event_id"]),
+            }
+
+        boost = float(event.get("boost_amount", 0.0) or 0.0)
+        if boost <= 0.0:
+            return {
+                "success": False,
+                "error": "invalid_boost_amount",
+                "message": "Arena shared competitor event boost_amount must be positive.",
+            }
+
+        sampled_boost = float(event.get("sampled_boost", boost) or boost)
+        feedback_u = float(event.get("feedback_u", 0.0) or 0.0)
+        unreleased_pre = float(event.get("unreleased_pre", 0.0) or 0.0)
+        feedback_term = float(event.get("feedback_term", 0.0) or 0.0)
+        winner = str(event.get("winner") or "sampled")
+        post_end_day = int(
+            event.get(
+                "post_end_day",
+                start_day + self.config.competitor_event_post_days,
+            )
+        )
+        description = str(
+            event.get("description")
+            or "A competitor launched a product update that shifted market expectations."
+        )
+
+        if winner == "feedback" and feedback_u > 0.0:
+            current_bank = get_global_state(
+                self.conn, "unreleased_base_quality_improvement", 0.0
+            )
+            set_global_state(
+                self.conn,
+                "unreleased_base_quality_improvement",
+                max(0.0, current_bank - feedback_u * current_bank),
+            )
+
+        cursor = self.conn.execute(
+            """
+            INSERT INTO competitor_events (
+                start_day, boost_amount, post_end_day, description, applied,
+                sampled_boost, feedback_u, unreleased_pre, feedback_term, winner
+            )
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+            """,
+            (
+                start_day,
+                boost,
+                post_end_day,
+                description,
+                sampled_boost,
+                feedback_u,
+                unreleased_pre,
+                feedback_term,
+                winner,
+            ),
+        )
+
+        update_global_drift(self.conn, boost)
+
+        for group_id, coef in COMPETITOR_REACTIVITY_Q_BIAS.items():
+            if coef == 0.0:
+                continue
+            update_group_drift(self.conn, group_id, coef * boost, 0.0, start_day)
+
+        segment_drain_u_by_group = event.get("segment_drain_u_by_group") or {}
+        seg_rows = self.conn.execute(
+            "SELECT group_id FROM group_parameters"
+        ).fetchall()
+        for seg_row in seg_rows:
+            seg_group_id = seg_row["group_id"]
+            seg_bank_key = f"unreleased_targeted_dev_{seg_group_id}"
+            seg_unreleased = get_global_state(self.conn, seg_bank_key, 0.0)
+            if seg_unreleased <= 0.0:
+                continue
+            try:
+                seg_u = float(segment_drain_u_by_group.get(seg_group_id, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                seg_u = 0.0
+            seg_u = clamp(
+                seg_u,
+                self.config.competitor_segment_drain_u_min,
+                self.config.competitor_segment_drain_u_max,
+            )
+            seg_drain = seg_u * seg_unreleased
+            if seg_drain <= 0.0:
+                continue
+            update_group_drift(self.conn, seg_group_id, seg_drain, 0.0, start_day)
+            set_global_state(
+                self.conn,
+                seg_bank_key,
+                max(0.0, seg_unreleased - seg_drain),
+            )
+
+        self.conn.commit()
+        return {
+            "success": True,
+            "applied": True,
+            "event_id": int(cursor.lastrowid),
+            "start_day": start_day,
+            "boost_amount": boost,
+        }
+
     def _generate_competitor_event_posts(self):
         """Generate social media posts for active competitor events.
 
@@ -7326,7 +8385,7 @@ Guidelines:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, sat_snapshot_rows)
 
-    def step_week(self) -> DayResult:
+    def step_week(self, skip_customer_acquisition: bool = False) -> DayResult:
         """Simulate one week (7 days) and return accumulated results.
 
         Calls step_day() 7 times internally. Customer social media posts
@@ -7345,7 +8404,7 @@ Guidelines:
 
             # Suppress customer social posts for first 6 days of the week
             self._suppress_customer_posts = (i < 6)
-            day_result = self.step_day()
+            day_result = self.step_day(skip_customer_acquisition=skip_customer_acquisition)
 
             if accumulated is None:
                 # First day — copy all fields
@@ -7413,7 +8472,11 @@ Guidelines:
 
         return accumulated
 
-    def step_day(self) -> DayResult:
+    def step_day(
+        self,
+        skip_customer_acquisition: bool = False,
+        customer_acquisition_fn: Optional[Callable[[dict], dict]] = None,
+    ) -> DayResult:
         """Simulate one day and return results."""
         import time as _time
         _step_start = _time.monotonic()
@@ -7540,7 +8603,12 @@ Guidelines:
 
         # Generate new customers (subscribe directly based on curve)
         _t0 = _time.monotonic()
-        gen_result = self._generate_new_customers(config)
+        if customer_acquisition_fn is not None:
+            gen_result = customer_acquisition_fn(config)
+        elif skip_customer_acquisition:
+            gen_result = self._empty_customer_generation_result()
+        else:
+            gen_result = self._generate_new_customers(config)
         new_subscribers = gen_result['total_new']  # kept for backward compat
         new_leads = gen_result['total_leads']
         _timings['generate_customers'] = _time.monotonic() - _t0
@@ -7635,4 +8703,3 @@ Guidelines:
             cash=cash,
             mrr=mrr,
         )
-

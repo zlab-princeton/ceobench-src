@@ -465,6 +465,17 @@ class BenchmarkConfig:
     # Lead acquisition cost: fixed cost per new lead (covers onboarding/evaluation)
     lead_acquisition_cost: float = 0.5  # v3.3u: halved from 1.0 (reduce hidden burn from high-lead-volume advertising)
 
+    # Arena-only hidden choice frictions. These are not agent levers; they make
+    # multi-company choice source/incumbent-first while preserving CEOBench's
+    # underlying acceptability rule.
+    arena_comparison_hurdle_mean: float = 0.03
+    arena_comparison_hurdle_std: float = 0.02
+    arena_comparison_hurdle_max: float = 0.10
+    arena_switching_noise_mean: float = 0.05
+    arena_switching_noise_std: float = 0.03
+    arena_switching_noise_max: float = 0.12
+    arena_relationship_inertia_scale: float = 0.05
+
     # Network effect: leads generated per 1000 existing customers in each group
     # Read as: "1000 existing S1 customers → ~87 new S1 leads/day"
     # Models organic referrals, word-of-mouth, community growth

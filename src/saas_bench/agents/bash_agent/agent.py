@@ -28,8 +28,10 @@ class Message:
     name: Optional[str] = None
 
 
-# Regex to detect dashboard in bash output (day advancement)
-_DASHBOARD_RE = re.compile(r'=== Day (\d+) Dashboard ===')
+# Regex to detect dashboard in bash output (week/day advancement)
+_DASHBOARD_RE = re.compile(
+    r'=== (?:Day (?P<day>\d+) Dashboard|Week \d+ Dashboard \(Day (?P<week_day>\d+)\)) ==='
+)
 
 
 class BashAgent(BaseAgent):
@@ -226,11 +228,11 @@ class BashAgent(BaseAgent):
         """
         match = _DASHBOARD_RE.search(bash_output)
         if match:
-            new_day = int(match.group(1))
+            new_day = int(match.group('day') or match.group('week_day'))
             if new_day > self.current_day:
                 self._day_advanced = True
-                # Extract dashboard from the output (everything from === Day N ===)
-                dashboard_start = bash_output.index(f"=== Day {new_day} Dashboard ===")
+                # Extract dashboard from the output.
+                dashboard_start = match.start()
                 self._new_dashboard = bash_output[dashboard_start:]
                 return True
         return False
@@ -463,6 +465,7 @@ class BashAgent(BaseAgent):
         import time as _time
         import traceback
         import signal
+        import threading
         import openai
 
         LLM_WALL_CLOCK_TIMEOUT = 600  # 10min hard wall-clock limit per LLM call
@@ -517,14 +520,21 @@ class BashAgent(BaseAgent):
                     # produces real chain-of-thought in `message.reasoning`.
                     api_kwargs['extra_body'] = {'chat_template_kwargs': {'thinking': True}}
 
-                # Set hard wall-clock timeout via signal.alarm
-                old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
-                signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
-                try:
-                    response = self.client.chat.completions.create(**api_kwargs)
-                finally:
-                    signal.alarm(0)  # Cancel alarm
-                    signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+                if threading.current_thread() is threading.main_thread():
+                    # Set hard wall-clock timeout via signal.alarm. Python only
+                    # allows signal handlers in the main interpreter thread.
+                    old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
+                    signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
+                    try:
+                        response = self.client.chat.completions.create(**api_kwargs)
+                    finally:
+                        signal.alarm(0)  # Cancel alarm
+                        signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+                else:
+                    response = self.client.chat.completions.create(
+                        **api_kwargs,
+                        timeout=LLM_WALL_CLOCK_TIMEOUT,
+                    )
                 self.total_turns += 1
                 self._consecutive_errors = 0
 
@@ -702,6 +712,7 @@ class BashAgent(BaseAgent):
         import time as _time
         import traceback
         import signal
+        import threading
         import openai
 
         LLM_WALL_CLOCK_TIMEOUT = 600
@@ -756,14 +767,21 @@ class BashAgent(BaseAgent):
                 if self.reasoning_effort:
                     api_kwargs['reasoning'] = {'effort': self.reasoning_effort, 'summary': 'auto'}
 
-                # Set hard wall-clock timeout via signal.alarm
-                old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
-                signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
-                try:
-                    response = self.client.responses.create(**api_kwargs)
-                finally:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
+                if threading.current_thread() is threading.main_thread():
+                    # Set hard wall-clock timeout via signal.alarm. Python only
+                    # allows signal handlers in the main interpreter thread.
+                    old_handler = signal.signal(signal.SIGALRM, _llm_timeout_handler)
+                    signal.alarm(LLM_WALL_CLOCK_TIMEOUT)
+                    try:
+                        response = self.client.responses.create(**api_kwargs)
+                    finally:
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_handler)
+                else:
+                    response = self.client.responses.create(
+                        **api_kwargs,
+                        timeout=LLM_WALL_CLOCK_TIMEOUT,
+                    )
 
                 self.total_turns += 1
                 self._consecutive_errors = 0
