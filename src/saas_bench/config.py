@@ -674,6 +674,10 @@ class BenchmarkConfig:
     #   - "anthropic": Direct Anthropic SDK; requires ANTHROPIC_API_KEY.
     #                  Use the public model name (e.g. "claude-haiku-4-5"). No AWS credentials needed.
     #   - "openai":    OpenAI Responses API; requires OPENAI_API_KEY.
+    #                  Set OPENAI_BASE_URL for OpenAI-compatible endpoints.
+    #                  For Azure OpenAI, set AZURE_OPENAI_ENDPOINT,
+    #                  AZURE_OPENAI_API_KEY, and AZURE_OPENAI_API_VERSION.
+    #                  Azure model values are deployment names.
     social_post_llm_model: str = "claude-haiku-4-5"
     social_post_llm_provider: str = "anthropic"  # "bedrock" | "anthropic" | "openai"
     social_post_llm_temperature: float = 0.9  # Higher for creative variety

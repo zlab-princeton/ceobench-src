@@ -146,13 +146,37 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
     if (
         config.social_post_llm_provider == "openai"
         or config.enterprise_llm_provider == "openai"
-    ) and not os.environ.get("OPENAI_API_KEY"):
-        print(
-            "Error: simulator OpenAI provider requires OPENAI_API_KEY. "
-            "It does not use agent-only credentials such as --api-key.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    ):
+        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        if azure_endpoint:
+            if not (
+                os.environ.get("AZURE_OPENAI_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            ):
+                print(
+                    "Error: simulator Azure OpenAI provider requires "
+                    "AZURE_OPENAI_API_KEY or OPENAI_API_KEY. It does not use "
+                    "agent-only credentials such as --api-key.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not os.environ.get("AZURE_OPENAI_API_VERSION"):
+                print(
+                    "Error: simulator Azure OpenAI provider requires "
+                    "AZURE_OPENAI_API_VERSION.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif not os.environ.get("OPENAI_API_KEY"):
+            print(
+                "Error: simulator OpenAI provider requires OPENAI_API_KEY. "
+                "Set OPENAI_BASE_URL for OpenAI-compatible endpoints, or "
+                "AZURE_OPENAI_ENDPOINT plus AZURE_OPENAI_API_VERSION for Azure "
+                "OpenAI. It does not use agent-only credentials such as "
+                "--api-key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
@@ -172,9 +196,30 @@ def _create_simulator_openai_client(config: BenchmarkConfig):
     ):
         return None
 
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if azure_endpoint:
+        from openai import AzureOpenAI
+
+        api_key = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        return AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
+            api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+        )
+
     from openai import OpenAI
 
-    return OpenAI()
+    client_kwargs = {}
+    if os.environ.get("OPENAI_API_KEY"):
+        client_kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_BASE_URL"):
+        client_kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+    if os.environ.get("OPENAI_ORG_ID"):
+        client_kwargs["organization"] = os.environ["OPENAI_ORG_ID"]
+    if os.environ.get("OPENAI_PROJECT"):
+        client_kwargs["project"] = os.environ["OPENAI_PROJECT"]
+
+    return OpenAI(**client_kwargs)
 
 
 # =========================================================================

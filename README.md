@@ -85,6 +85,31 @@ enterprise_llm_provider: str = "anthropic"
 enterprise_llm_model: str = "claude-sonnet-4-5"
 ```
 
+**Option C: OpenAI, OpenAI-compatible, or Azure OpenAI simulator models**
+
+```bash
+export OPENAI_API_KEY="..."
+
+# Optional: OpenAI-compatible hosted endpoint.
+export OPENAI_BASE_URL="https://your-endpoint.example/v1"
+```
+
+For Azure OpenAI, use Azure-specific environment variables instead:
+
+```bash
+export AZURE_OPENAI_API_KEY="..."
+export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
+export AZURE_OPENAI_API_VERSION="2025-04-01-preview"
+```
+
+```python
+social_post_llm_provider: str = "openai"
+social_post_llm_model: str = "your-social-model-or-azure-deployment"
+
+enterprise_llm_provider: str = "openai"
+enterprise_llm_model: str = "your-enterprise-model-or-azure-deployment"
+```
+
 The LLM config fields are:
 
 - `agent_llm_provider`, `agent_llm_model`, `agent_llm_reasoning_effort`
