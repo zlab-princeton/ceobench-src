@@ -85,6 +85,51 @@ enterprise_llm_provider: str = "anthropic"
 enterprise_llm_model: str = "claude-sonnet-4-5"
 ```
 
+**Option C: OpenAI, OpenAI-compatible, or Azure OpenAI simulator models**
+
+```bash
+export OPENAI_API_KEY="..."
+
+# Optional: OpenAI-compatible hosted endpoint.
+export OPENAI_BASE_URL="https://your-endpoint.example/v1"
+```
+
+For Azure OpenAI, use Azure-specific environment variables instead:
+
+```bash
+export AZURE_OPENAI_API_KEY="..."
+export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com/"
+export AZURE_OPENAI_API_VERSION="2025-04-01-preview"
+```
+
+```python
+social_post_llm_provider: str = "openai"
+social_post_llm_model: str = "your-social-model-or-azure-deployment"
+
+enterprise_llm_provider: str = "openai"
+enterprise_llm_model: str = "your-enterprise-model-or-azure-deployment"
+```
+
+For hosted OpenAI Responses-compatible endpoints that require custom query
+params, headers, or a private CA bundle, configure non-secret transport
+settings in `src/saas_bench/config.py` and keep secret values in environment.
+These settings currently apply only when the simulator provider is `"openai"`;
+chat-completions-only endpoints, including many local/open-source model servers,
+are not supported by this path yet.
+
+```python
+simulator_llm_base_url: str = "https://your-endpoint.example/openai/v1"
+simulator_llm_query_params: dict = {"api-version": "v1"}
+simulator_llm_tls_cert_path: str = "/path/to/ca-bundle.crt"
+simulator_llm_env_http_headers: dict = {"api-key": "AZURE_OPENAI_API_KEY"}
+```
+
+The same settings can be supplied without editing source through
+`SIMULATOR_LLM_BASE_URL`, `SIMULATOR_LLM_QUERY_PARAMS` (JSON object),
+`SIMULATOR_LLM_TLS_CERT_PATH`, and
+`SIMULATOR_LLM_ENV_HTTP_HEADERS` (JSON object mapping header names to env var
+names).
+
 The LLM config fields are:
 
 - `agent_llm_provider`, `agent_llm_model`, `agent_llm_reasoning_effort`

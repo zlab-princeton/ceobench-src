@@ -47,6 +47,10 @@ _SIMULATOR_LLM_CONFIG_FIELDS = (
     "social_post_llm_model",
     "enterprise_llm_provider",
     "enterprise_llm_model",
+    "simulator_llm_base_url",
+    "simulator_llm_query_params",
+    "simulator_llm_tls_cert_path",
+    "simulator_llm_env_http_headers",
 )
 
 
@@ -123,6 +127,67 @@ def _resolve_session(base: Path, session_id: Optional[str]) -> str:
     return latest
 
 
+def _parse_env_json_object(name: str) -> dict:
+    raw = os.environ.get(name)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"Error: {name} must be a JSON object: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(value, dict):
+        print(f"Error: {name} must be a JSON object.", file=sys.stderr)
+        sys.exit(1)
+    return {str(k): str(v) for k, v in value.items()}
+
+
+def _simulator_uses_openai(config: BenchmarkConfig) -> bool:
+    return (
+        config.social_post_llm_provider == "openai"
+        or config.enterprise_llm_provider == "openai"
+    )
+
+
+def _simulator_llm_base_url(config: BenchmarkConfig) -> str:
+    return (
+        getattr(config, "simulator_llm_base_url", "")
+        or os.environ.get("SIMULATOR_LLM_BASE_URL", "")
+        or os.environ.get("OPENAI_BASE_URL", "")
+    )
+
+
+def _simulator_llm_query_params(config: BenchmarkConfig) -> dict:
+    query = dict(getattr(config, "simulator_llm_query_params", {}) or {})
+    query.update(_parse_env_json_object("SIMULATOR_LLM_QUERY_PARAMS"))
+    api_version = os.environ.get("SIMULATOR_LLM_API_VERSION")
+    if api_version:
+        query.setdefault("api-version", api_version)
+    return query
+
+
+def _simulator_llm_tls_cert_path(config: BenchmarkConfig) -> str:
+    return (
+        getattr(config, "simulator_llm_tls_cert_path", "")
+        or os.environ.get("SIMULATOR_LLM_TLS_CERT_PATH", "")
+    )
+
+
+def _simulator_llm_headers_from_env(config: BenchmarkConfig) -> tuple[dict, list[str]]:
+    env_headers = dict(getattr(config, "simulator_llm_env_http_headers", {}) or {})
+    env_headers.update(_parse_env_json_object("SIMULATOR_LLM_ENV_HTTP_HEADERS"))
+
+    headers = {}
+    missing = []
+    for header, env_name in env_headers.items():
+        value = os.environ.get(env_name)
+        if value is None:
+            missing.append(env_name)
+        else:
+            headers[header] = value
+    return headers, missing
+
+
 def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
     """Validate and serialize simulator-side LLM provider/model config."""
     valid_providers = {"bedrock", "anthropic", "openai"}
@@ -143,16 +208,57 @@ def _apply_simulator_llm_config(config: BenchmarkConfig) -> dict:
         )
         sys.exit(1)
 
-    if (
-        config.social_post_llm_provider == "openai"
-        or config.enterprise_llm_provider == "openai"
-    ) and not os.environ.get("OPENAI_API_KEY"):
-        print(
-            "Error: simulator OpenAI provider requires OPENAI_API_KEY. "
-            "It does not use agent-only credentials such as --api-key.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    if _simulator_uses_openai(config):
+        openai_base_url = _simulator_llm_base_url(config)
+        openai_headers, missing_header_envs = _simulator_llm_headers_from_env(config)
+        if missing_header_envs:
+            missing = ", ".join(sorted(missing_header_envs))
+            print(
+                f"Error: simulator LLM provider requires env vars for "
+                f"configured HTTP headers: {missing}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        if openai_base_url:
+            if not (os.environ.get("OPENAI_API_KEY") or openai_headers):
+                print(
+                    "Error: simulator LLM endpoint requires "
+                    "OPENAI_API_KEY or simulator_llm_env_http_headers. "
+                    "It does not use agent-only credentials such as --api-key.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif azure_endpoint:
+            if not (
+                os.environ.get("AZURE_OPENAI_API_KEY")
+                or os.environ.get("OPENAI_API_KEY")
+            ):
+                print(
+                    "Error: simulator Azure OpenAI provider requires "
+                    "AZURE_OPENAI_API_KEY or OPENAI_API_KEY. It does not use "
+                    "agent-only credentials such as --api-key.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not os.environ.get("AZURE_OPENAI_API_VERSION"):
+                print(
+                    "Error: simulator Azure OpenAI provider requires "
+                    "AZURE_OPENAI_API_VERSION.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        elif not os.environ.get("OPENAI_API_KEY"):
+            print(
+                "Error: simulator LLM provider requires OPENAI_API_KEY. "
+                "Set OPENAI_BASE_URL for OpenAI-compatible endpoints, or "
+                "AZURE_OPENAI_ENDPOINT plus AZURE_OPENAI_API_VERSION for Azure "
+                "OpenAI. It does not use agent-only credentials such as "
+                "--api-key.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     return {field: getattr(config, field) for field in _SIMULATOR_LLM_CONFIG_FIELDS}
 
@@ -165,16 +271,57 @@ def _restore_simulator_llm_config(config: BenchmarkConfig, meta: dict) -> None:
             setattr(config, attr, value)
 
 
-def _create_simulator_openai_client(config: BenchmarkConfig):
-    if (
-        config.social_post_llm_provider != "openai"
-        and config.enterprise_llm_provider != "openai"
-    ):
+def _create_simulator_llm_client(config: BenchmarkConfig):
+    if not _simulator_uses_openai(config):
         return None
+
+    openai_base_url = _simulator_llm_base_url(config)
+    if openai_base_url:
+        from openai import OpenAI
+
+        headers, _missing = _simulator_llm_headers_from_env(config)
+        query = _simulator_llm_query_params(config)
+        client_kwargs = {
+            "api_key": os.environ.get("OPENAI_API_KEY") or "unused",
+            "base_url": openai_base_url,
+        }
+        if headers:
+            client_kwargs["default_headers"] = headers
+        if query:
+            client_kwargs["default_query"] = query
+
+        tls_cert_path = _simulator_llm_tls_cert_path(config)
+        if tls_cert_path:
+            import httpx
+
+            client_kwargs["http_client"] = httpx.Client(verify=tls_cert_path)
+
+        return OpenAI(**client_kwargs)
+
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if azure_endpoint:
+        from openai import AzureOpenAI
+
+        api_key = os.environ.get("AZURE_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        return AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
+            api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+        )
 
     from openai import OpenAI
 
-    return OpenAI()
+    client_kwargs = {}
+    if os.environ.get("OPENAI_API_KEY"):
+        client_kwargs["api_key"] = os.environ["OPENAI_API_KEY"]
+    if os.environ.get("OPENAI_BASE_URL"):
+        client_kwargs["base_url"] = os.environ["OPENAI_BASE_URL"]
+    if os.environ.get("OPENAI_ORG_ID"):
+        client_kwargs["organization"] = os.environ["OPENAI_ORG_ID"]
+    if os.environ.get("OPENAI_PROJECT"):
+        client_kwargs["project"] = os.environ["OPENAI_PROJECT"]
+
+    return OpenAI(**client_kwargs)
 
 
 # =========================================================================
@@ -204,7 +351,7 @@ def cmd_new_session(args, base: Path):
 
     # Initialize simulator with customer simulator
     customer_sim = CustomerSimulator(
-        client=_create_simulator_openai_client(config),
+        client=_create_simulator_llm_client(config),
         conn=conn,
         config=config,
     )
@@ -290,7 +437,7 @@ def cmd_start_server(args, base: Path):
     meta["simulator_llm"] = _apply_simulator_llm_config(config)
 
     customer_sim = CustomerSimulator(
-        client=_create_simulator_openai_client(config),
+        client=_create_simulator_llm_client(config),
         conn=conn,
         config=config,
     )

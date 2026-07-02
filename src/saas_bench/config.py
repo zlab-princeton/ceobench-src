@@ -674,6 +674,13 @@ class BenchmarkConfig:
     #   - "anthropic": Direct Anthropic SDK; requires ANTHROPIC_API_KEY.
     #                  Use the public model name (e.g. "claude-haiku-4-5"). No AWS credentials needed.
     #   - "openai":    OpenAI Responses API; requires OPENAI_API_KEY.
+    #                  Set OPENAI_BASE_URL for OpenAI Responses-compatible
+    #                  hosted endpoints.
+    #                  For Azure OpenAI, set AZURE_OPENAI_ENDPOINT,
+    #                  AZURE_OPENAI_API_KEY, and AZURE_OPENAI_API_VERSION.
+    #                  Azure model values are deployment names.
+    #                  For hosted OpenAI Responses-compatible endpoints with
+    #                  custom auth, use the simulator_llm_* fields below.
     social_post_llm_model: str = "claude-haiku-4-5"
     social_post_llm_provider: str = "anthropic"  # "bedrock" | "anthropic" | "openai"
     social_post_llm_temperature: float = 0.9  # Higher for creative variety
@@ -686,6 +693,17 @@ class BenchmarkConfig:
     enterprise_llm_provider: str = "anthropic"  # "bedrock" | "anthropic" | "openai"
     enterprise_llm_temperature: float = 0.7
     enterprise_llm_max_tokens: int = 300
+
+    # Optional simulator LLM transport settings for OpenAI Responses-compatible
+    # endpoints. These apply only when a simulator provider above is "openai".
+    # Chat-completions-only endpoints, including many local/open-source model
+    # servers, are not supported by this path yet. Keep secrets in environment:
+    # env_http_headers maps HTTP header names to env var names, e.g.
+    # {"api-key": "AZURE_OPENAI_API_KEY"}.
+    simulator_llm_base_url: str = ""
+    simulator_llm_query_params: Dict[str, str] = field(default_factory=dict)
+    simulator_llm_tls_cert_path: str = ""
+    simulator_llm_env_http_headers: Dict[str, str] = field(default_factory=dict)
 
     # Bedrock configuration
     bedrock_region: str = "us-east-2"  # Ohio — AWS Bedrock region
