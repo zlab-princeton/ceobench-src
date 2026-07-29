@@ -134,6 +134,87 @@ def _create_anthropic_client(config: BenchmarkConfig):
     return Anthropic()
 
 
+def _get_usage_tokens(response) -> tuple[int, int]:
+    """Return Responses/Chat-style usage counts as (input, output)."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0, 0
+    input_tokens = (
+        getattr(usage, "input_tokens", None)
+        or getattr(usage, "prompt_tokens", None)
+        or 0
+    )
+    output_tokens = (
+        getattr(usage, "output_tokens", None)
+        or getattr(usage, "completion_tokens", None)
+        or 0
+    )
+    return int(input_tokens), int(output_tokens)
+
+
+def _extract_openai_output_text(response) -> str:
+    """Extract text from OpenAI Responses API objects and compatible shims."""
+    output_text = getattr(response, "output_text", None)
+    if output_text is not None:
+        return str(output_text).strip()
+
+    parts = []
+    for item in getattr(response, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            text = getattr(content, "text", None)
+            if text is None and isinstance(content, dict):
+                text = content.get("text")
+            if text:
+                parts.append(str(text))
+    return "\n".join(parts).strip()
+
+
+def _call_openai_responses(
+    client,
+    *,
+    model: str,
+    user_prompt: str,
+    system_prompt: str | None = None,
+    max_output_tokens: int,
+    reasoning_effort: str | None = "low",
+) -> tuple[str, int, int]:
+    """Call an OpenAI-compatible Responses API client.
+
+    Some OpenAI-compatible and Azure deployments do not accept the `reasoning`
+    parameter for all model deployments. Preserve the existing low-reasoning
+    behavior when supported, then retry once without it when the endpoint
+    rejects that parameter.
+    """
+    if client is None:
+        raise RuntimeError(
+            "Simulator OpenAI provider is configured but no OpenAI client is available."
+        )
+
+    input_items = []
+    if system_prompt:
+        input_items.append({"role": "system", "content": system_prompt})
+    input_items.append({"role": "user", "content": user_prompt})
+
+    kwargs = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max_output_tokens,
+    }
+    if reasoning_effort:
+        kwargs["reasoning"] = {"effort": reasoning_effort}
+
+    try:
+        response = client.responses.create(**kwargs)
+    except Exception as exc:
+        if "reasoning" not in kwargs or "reasoning" not in str(exc).lower():
+            raise
+        kwargs.pop("reasoning", None)
+        response = client.responses.create(**kwargs)
+
+    input_tokens, output_tokens = _get_usage_tokens(response)
+    return _extract_openai_output_text(response), input_tokens, output_tokens
+
+
 @dataclass
 class CustomerLLMResponse:
     """Response from customer LLM."""
@@ -526,18 +607,14 @@ Output ONLY the post text, nothing else."""
         else:
             # Fallback to OpenAI
             print(f"[WARN] Social post using OpenAI fallback (provider={social_provider}, model={social_model}). Set social_post_llm_provider='bedrock' or 'anthropic' for Haiku 4.5.")
-            response = self.client.responses.create(
+            post_text, input_tokens, output_tokens = _call_openai_responses(
+                self.client,
                 model=social_model,
-                reasoning={"effort": "low"},
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 max_output_tokens=1000,
+                reasoning_effort="low",
             )
-            post_text = response.output_text.strip()
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
 
         # Debug: Log if empty response
         if not post_text:
@@ -763,18 +840,14 @@ Output JSON:
             else:
                 # Fallback to OpenAI
                 print(f"[WARN] Negotiation response using OpenAI fallback (provider={enterprise_provider}, model={enterprise_model}). Set enterprise_llm_provider='bedrock' or 'anthropic' for Sonnet 4.5.")
-                response = self.client.responses.create(
+                response_text, input_tokens, output_tokens = _call_openai_responses(
+                    self.client,
                     model=enterprise_model,
-                    reasoning={"effort": self.reasoning_effort},
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    max_output_tokens=300
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    max_output_tokens=300,
+                    reasoning_effort=self.reasoning_effort,
                 )
-                response_text = response.output_text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
 
             self._log_cost(day, 'customer_negotiation', input_tokens, output_tokens, model=enterprise_model)
 
@@ -919,18 +992,14 @@ Output ONLY the message text."""
             else:
                 # Fallback to OpenAI
                 print(f"[WARN] Initial outreach using OpenAI fallback (provider={enterprise_provider}, model={enterprise_model}). Set enterprise_llm_provider='bedrock' or 'anthropic' for Sonnet 4.5.")
-                response = self.client.responses.create(
+                text, input_tokens, output_tokens = _call_openai_responses(
+                    self.client,
                     model=enterprise_model,
-                    reasoning={"effort": self.reasoning_effort},
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": "Write your initial outreach message."}
-                    ],
-                    max_output_tokens=150
+                    system_prompt=system_prompt,
+                    user_prompt="Write your initial outreach message.",
+                    max_output_tokens=150,
+                    reasoning_effort=self.reasoning_effort,
                 )
-                text = response.output_text.strip()
-                input_tokens = response.usage.input_tokens
-                output_tokens = response.usage.output_tokens
 
             self._log_cost(day, 'customer_initial_outreach', input_tokens, output_tokens, model=enterprise_model)
 
@@ -1034,7 +1103,7 @@ def generate_churn_message(
 # =========================================================================
 
 def judge_agent_social_post(
-    bedrock_client,
+    llm_client,
     config,
     post_content: str,
     group_id: str,
@@ -1047,10 +1116,10 @@ def judge_agent_social_post(
 ) -> tuple:
     """Judge an agent's social media post from a specific customer group's perspective.
 
-    Uses Haiku 4.5 on Bedrock. Returns (effect, reasoning) where effect is [-1.0, 1.0].
+    Returns (effect, reasoning) where effect is [-1.0, 1.0].
 
     Args:
-        bedrock_client: AnthropicBedrock client
+        llm_client: Anthropic-compatible or OpenAI-compatible client
         config: BenchmarkConfig
         post_content: The agent's post text
         group_id: Customer group being judged from
@@ -1131,16 +1200,25 @@ SCORE: <number between -1.0 and 1.0>
 REASON: <one sentence why>"""
 
     social_model = config.social_post_llm_model
-    response = bedrock_client.messages.create(
-        model=social_model,
-        max_tokens=100,
-        temperature=0.3,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    if config.social_post_llm_provider in ("bedrock", "anthropic"):
+        response = llm_client.messages.create(
+            model=social_model,
+            max_tokens=100,
+            temperature=0.3,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-    text = response.content[0].text.strip()
-    input_tokens = response.usage.input_tokens
-    output_tokens = response.usage.output_tokens
+        text = response.content[0].text.strip()
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+    else:
+        text, input_tokens, output_tokens = _call_openai_responses(
+            llm_client,
+            model=social_model,
+            user_prompt=prompt,
+            max_output_tokens=100,
+            reasoning_effort="low",
+        )
 
     # Parse structured response: "SCORE: <number>\nREASON: <text>"
     effect = 0.0
@@ -1158,7 +1236,7 @@ REASON: <one sentence why>"""
 
 
 def generate_customer_reply_to_agent(
-    bedrock_client,
+    llm_client,
     config,
     agent_post_content: str,
     group_id: str,
@@ -1172,7 +1250,7 @@ def generate_customer_reply_to_agent(
     Only called for viral reactions (|effect| >= threshold).
 
     Args:
-        bedrock_client: AnthropicBedrock client
+        llm_client: Anthropic-compatible or OpenAI-compatible client
         config: BenchmarkConfig
         agent_post_content: The agent's post text
         group_id: Customer group replying
@@ -1209,15 +1287,26 @@ The NovaMind CEO posted:
 Your reaction is {sentiment_desc} (score: {effect_score:.2f}). Write ONLY the reply tweet. Nothing else. Keep it SHORT — real people don't write essays in tweet replies. Do not include any meta-commentary or explanation."""
 
     social_model = config.social_post_llm_model
-    response = bedrock_client.messages.create(
-        model=social_model,
-        max_tokens=150,
-        temperature=0.9,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    if config.social_post_llm_provider in ("bedrock", "anthropic"):
+        response = llm_client.messages.create(
+            model=social_model,
+            max_tokens=150,
+            temperature=0.9,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+    else:
+        text, input_tokens, output_tokens = _call_openai_responses(
+            llm_client,
+            model=social_model,
+            user_prompt=prompt,
+            max_output_tokens=150,
+            reasoning_effort="low",
+        )
 
-    text = response.content[0].text.strip()
     # Clean up any quotes/formatting artifacts
     text = text.strip('"').strip("'").strip()
 
-    return text, response.usage.input_tokens, response.usage.output_tokens
+    return text, input_tokens, output_tokens

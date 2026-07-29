@@ -57,6 +57,7 @@ from .database import (
 from .personas import (
     initialize_all_personas, should_customer_post, generate_social_post,
 )
+from .customer_llm import _call_openai_responses
 from .enterprise import (
     get_threads_needing_reply, get_negotiation_state, schedule_customer_reply,
     create_negotiation_thread, add_customer_message, close_thread,
@@ -4152,17 +4153,17 @@ class Simulator:
                             messages=[{"role": "user", "content": item['prompt']}],
                         )
                         text = llm_response.content[0].text.strip()
+                        input_tokens = llm_response.usage.input_tokens
+                        output_tokens = llm_response.usage.output_tokens
                     else:
-                        llm_response = self.customer_simulator.client.responses.create(
+                        text, input_tokens, output_tokens = _call_openai_responses(
+                            self.customer_simulator.client,
                             model=social_model,
-                            reasoning={"effort": "low"},
-                            input=[
-                                {"role": "system", "content": "You are a social media content generator simulating realistic business professionals posting about economic conditions."},
-                                {"role": "user", "content": item['prompt']}
-                            ],
+                            system_prompt="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                            user_prompt=item['prompt'],
                             max_output_tokens=300,
+                            reasoning_effort="low",
                         )
-                        text = llm_response.output_text.strip()
 
                     # Clean: strip numbering/bullets if LLM added them
                     import re
@@ -4171,8 +4172,8 @@ class Simulator:
                     text = text.strip('"').strip("'")
 
                     return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': llm_response.usage.input_tokens,
-                            'output_tokens': llm_response.usage.output_tokens}
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens}
                 except Exception as e:
                     import sys
                     print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
@@ -4319,17 +4320,17 @@ class Simulator:
                             messages=[{"role": "user", "content": item['prompt']}],
                         )
                         text = llm_response.content[0].text.strip()
+                        input_tokens = llm_response.usage.input_tokens
+                        output_tokens = llm_response.usage.output_tokens
                     else:
-                        llm_response = self.customer_simulator.client.responses.create(
+                        text, input_tokens, output_tokens = _call_openai_responses(
+                            self.customer_simulator.client,
                             model=social_model,
-                            reasoning={"effort": "low"},
-                            input=[
-                                {"role": "system", "content": "You are a social media content generator simulating realistic business professionals posting about economic conditions."},
-                                {"role": "user", "content": item['prompt']}
-                            ],
+                            system_prompt="You are a social media content generator simulating realistic business professionals posting about economic conditions.",
+                            user_prompt=item['prompt'],
                             max_output_tokens=300,
+                            reasoning_effort="low",
                         )
-                        text = llm_response.output_text.strip()
 
                     import re
                     text = re.sub(r'^\d+[\.\)]\s*', '', text).strip()
@@ -4337,8 +4338,8 @@ class Simulator:
                     text = text.strip('"').strip("'")
 
                     return {'type': 'macro', **item, 'text': text, 'success': True,
-                            'input_tokens': llm_response.usage.input_tokens,
-                            'output_tokens': llm_response.usage.output_tokens}
+                            'input_tokens': input_tokens,
+                            'output_tokens': output_tokens}
                 except Exception as e:
                     import sys
                     print(f"[sim] macro post LLM failed: {e}", file=sys.stderr)
@@ -4637,8 +4638,13 @@ class Simulator:
             WHERE s.status = 'subscribed' AND s.end_day IS NULL
         """).fetchone()[0]
 
-        # Use social_post_client (bedrock or direct anthropic) — both expose the same .messages.create() API
-        bedrock_client = self.customer_simulator.social_post_client
+        # Route through the configured simulator provider. Anthropic-compatible
+        # providers expose .messages.create(); OpenAI-compatible providers use
+        # the Responses API client.
+        if self.config.social_post_llm_provider in ("bedrock", "anthropic"):
+            social_llm_client = self.customer_simulator.social_post_client
+        else:
+            social_llm_client = self.customer_simulator.client
         social_model = self.config.social_post_llm_model
         viral_threshold = 0.6
 
@@ -4671,7 +4677,7 @@ class Simulator:
 
                     future = executor.submit(
                         judge_agent_social_post,
-                        bedrock_client, self.config, content,
+                        social_llm_client, self.config, content,
                         gid, desc, tone, total_subs, mrr,
                         recent_posts, reply_to_content
                     )
@@ -4765,7 +4771,7 @@ class Simulator:
 
                         future = executor.submit(
                             generate_customer_reply_to_agent,
-                            bedrock_client, self.config, content,
+                            social_llm_client, self.config, content,
                             gid, desc, tone, eff, reply_to_content
                         )
                         reply_futures[future] = gid
@@ -5822,19 +5828,17 @@ Guidelines:
                 model=social_model
             )
         else:
-            response = self.customer_simulator.client.responses.create(
+            post_text, input_tokens, output_tokens = _call_openai_responses(
+                self.customer_simulator.client,
                 model=social_model,
-                reasoning={"effort": "low"},
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 max_output_tokens=post_max_tokens,
+                reasoning_effort="low",
             )
-            post_text = response.output_text.strip()
             self.customer_simulator._log_cost(
                 self.current_day, 'competitor_event_post',
-                response.usage.input_tokens, response.usage.output_tokens,
+                input_tokens, output_tokens,
                 model=social_model
             )
 
