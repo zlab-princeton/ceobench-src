@@ -140,6 +140,7 @@ Enterprise negotiation turns — each row is one message in a conversation. mess
 | Column | Description |
 |--------|-------------|
 | `message_id` | INTEGER PRIMARY KEY — Unique message identifier (use this to reference messages in send_enterprise_deal/reject_enterprise_deal) |
+| `thread_id` | INTEGER — Conversation identifier grouping related messages; use message_id when responding to a message |
 | `customer_id` | INTEGER — Foreign key to customers |
 | `thread_type` | TEXT — 'new_lead', 'plan_change', 'churn_prevention', 'renegotiation', 'renewal', 'general' |
 | `turn_number` | INTEGER — 0-indexed turn within thread |
@@ -297,6 +298,7 @@ Public customer feedback posts on social media
 |--------|-------------|
 | `post_id` | INTEGER PRIMARY KEY — Unique post ID |
 | `day` | INTEGER — Day posted |
+| `reply_to_agent_post_id` | INTEGER — Agent post this customer post replies to (NULL for an original post) |
 | `content` | TEXT — Post content text |
 
 ---

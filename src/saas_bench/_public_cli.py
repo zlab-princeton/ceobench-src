@@ -14,6 +14,8 @@ CLI and the ``novamind_api`` SDK source at ``docs/novamind_api/``.
 """
 
 import json
+import uuid
+import fcntl
 import os
 import signal
 import subprocess
@@ -112,7 +114,7 @@ def _session_meta(session_id: str) -> dict:
     return json.loads(meta_path.read_text())
 
 
-def _ensure_server_running(session_id: str) -> int:
+def _ensure_server_running(session_id: str, *, resume=False) -> int:
     env_port = os.environ.get("NOVAMIND_API_PORT")
     if env_port:
         return int(env_port)
@@ -130,6 +132,21 @@ def _ensure_server_running(session_id: str) -> int:
             pid_file.unlink(missing_ok=True)
             port_file.unlink(missing_ok=True)
 
+    meta = _session_meta(session_id)
+    if meta.get('status') == 'unrecoverable':
+        raise SystemExit('Unrecoverable session. Exit this agent run; do not start another game.')
+    if meta.get('status') != 'created' and not resume:
+        raise SystemExit('Server is not running. Use resume for this same session; never replay a turn.')
+    # Serialize launches across CLI processes while the server loads its DB.
+    startup_lock = open(sdir / '.startup.lock', 'a+')
+    fcntl.flock(startup_lock, fcntl.LOCK_EX)
+    if pid_file.exists() and port_file.exists():
+        try:
+            os.kill(int(pid_file.read_text()), 0)
+            return int(port_file.read_text())
+        except ProcessLookupError:
+            pass
+
     # Redirect server stdout/stderr to a log file so the orphaned server
     # can keep writing after this CLI process exits. Previously we used
     # subprocess.PIPE; once the parent CLI exited, the pipe's read end was
@@ -142,7 +159,7 @@ def _ensure_server_running(session_id: str) -> int:
     try:
         cmd = _server_cmd_prefix() + ["--base", str(_base_dir()),
                                        "start-server", "--session", session_id]
-        subprocess.Popen(
+        child = subprocess.Popen(
             cmd,
             stdout=log_fd,
             stderr=log_fd,
@@ -153,8 +170,10 @@ def _ensure_server_running(session_id: str) -> int:
     finally:
         log_fd.close()
 
-    for _ in range(100):  # 10 s
+    for _ in range(1800):  # Three minutes; one launch only, never spawn a retry.
         time.sleep(0.1)
+        if child.poll() is not None:
+            raise SystemExit("Server could not resume. Report failure and exit; do not create another game.")
         if port_file.exists():
             try:
                 return int(port_file.read_text().strip())
@@ -236,6 +255,8 @@ def cmd_next_week(args):
             "cash_26wk": {"point": float(args.cash_26wk_point), "lower": float(args.cash_26wk_lower), "upper": float(args.cash_26wk_upper)},
         }
     }
+    body["request_id"] = args.request_id or uuid.uuid4().hex
+    print(json.dumps({"request_id": body["request_id"]}), file=sys.stderr, flush=True)
     result = _api_call(port, "POST", "/next-week", body)
     if result.get("success"):
         dashboard = result.get("dashboard", "")
@@ -425,17 +446,27 @@ def cmd_stop(args):
     pid = int(pid_file.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(30):
-            time.sleep(0.1)
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                break
-        print(json.dumps({"success": True, "stopped_pid": pid}))
+        from saas_bench.session_integrity import wait_for_exit
+        stopped = wait_for_exit(pid)
+        print(json.dumps({'success': stopped, 'stopped_pid': pid if stopped else None,
+                          'error': None if stopped else 'stop_pending_active_request'}))
+
     except ProcessLookupError:
         pid_file.unlink(missing_ok=True)
         (sdir / ".server.port").unlink(missing_ok=True)
         print(json.dumps({"success": True, "message": "Server was not running"}))
+
+
+def cmd_resume(args):
+    session_id = _resolve_session(args.session)
+    port = _ensure_server_running(session_id, resume=True)
+    print(json.dumps({'success': True, 'session_id': session_id, 'port': port}))
+
+
+def cmd_request_status(args):
+    session_id = _resolve_session(args.session)
+    port = _ensure_server_running(session_id)
+    print(json.dumps(_api_call(port, 'GET', '/requests/' + args.request_id)))
 
 
 def main():
@@ -483,6 +514,7 @@ Examples:
         ),
     )
     p.add_argument("rationale", type=str, help="Your strategic reasoning for this week's actions (required, non-empty)")
+    p.add_argument("--request-id", default=None, help="Stable request ID for safe retry of exactly the same submission")
     p.add_argument("cash_1wk_point",  type=float, help="Point estimate of cash +7 days")
     p.add_argument("cash_1wk_lower",  type=float, help="95%% CI lower bound, +7 days")
     p.add_argument("cash_1wk_upper",  type=float, help="95%% CI upper bound, +7 days")
@@ -518,6 +550,11 @@ Examples:
 
     subparsers.add_parser("list-sessions", help="List all sessions")
 
+    p = subparsers.add_parser("resume", help="Resume only a complete checkpoint of the existing game")
+    p.add_argument('--session', default=None)
+    p = subparsers.add_parser("request-status", help="Inspect an existing request; never replay an unknown outcome")
+    p.add_argument('request_id')
+    p.add_argument('--session', default=None)
     p = subparsers.add_parser("stop", help="Stop the simulation server")
     p.add_argument("--session", type=str, default=None, help="Session ID (default: latest)")
 
@@ -533,6 +570,8 @@ Examples:
         "history": cmd_history,
         "list-sessions": cmd_list_sessions,
         "stop": cmd_stop,
+        "resume": cmd_resume,
+        "request-status": cmd_request_status,
     }
 
     cmd_map[args.command](args)

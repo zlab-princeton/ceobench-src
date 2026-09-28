@@ -1,0 +1,9 @@
+# CEOBench frozen runtime: Python 3.13. Install before gameplay; never mutate mid-run.
+numpy==2.4.1
+pandas==2.3.3
+scikit-learn==1.8.0
+scipy==1.17.0
+openai==2.15.0
+anthropic[bedrock]==0.79.0
+sqlcipher3-binary==0.6.0
+python-dotenv==1.2.1

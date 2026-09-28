@@ -13,6 +13,8 @@ Commands:
 """
 
 import argparse
+import fcntl
+import io
 import json
 import os
 import signal
@@ -34,12 +36,17 @@ from saas_bench.event_logger import EventLogger
 from saas_bench.api_server import NovaMindAPIServer
 from saas_bench.db_protection import (
     protect_db,
+    create_encrypted,
     save_session_db,
     load_session_db,
     snapshot_to_plain,
     AsyncSaver,
 )
 from saas_bench.docs_generator import initialize_workspace
+from saas_bench.session_integrity import (
+    atomic_json, initialize_integrity, write_checkpoint, read_checkpoint,
+    restore_runtime, RequestJournal,
+)
 
 
 _SIMULATOR_LLM_CONFIG_FIELDS = (
@@ -183,6 +190,14 @@ def _create_simulator_openai_client(config: BenchmarkConfig):
 
 def cmd_new_session(args, base: Path):
     """Create a new simulation session."""
+    # A failed or completed game never grants permission for another attempt.
+    base.mkdir(parents=True, exist_ok=True)
+    creation_lock = open(base / '.game-creation.lock', 'a+')
+    fcntl.flock(creation_lock, fcntl.LOCK_EX)
+    if (base / '.game-started').exists() or any(_sessions_dir(base).glob('*/session.json')):
+        print(json.dumps({'success': False, 'error': 'one_game_only'}))
+        return
+    atomic_json(base / ".game-started", {"created_at": time.time()})
     session_id = _generate_session_id()
     sdir = _session_dir(base, session_id)
     sdir.mkdir(parents=True, exist_ok=True)
@@ -199,8 +214,14 @@ def cmd_new_session(args, base: Path):
     )
     simulator_llm = _apply_simulator_llm_config(config)
 
-    # Initialize database in memory (never writes plain SQLite to disk)
-    conn = init_database(":memory:")
+    # Initialize directly in encrypted storage: no agent-readable plaintext
+    # temporary SQLite file exists, even during initial session creation.
+    import sqlcipher3
+    nmdb_path = _session_nmdb_path(base, session_id)
+    conn = create_encrypted(nmdb_path)
+    conn.row_factory = sqlcipher3.Row
+    init_database(nmdb_path, connection=conn)
+    conn.execute('PRAGMA synchronous=FULL')
 
     # Initialize simulator with customer simulator
     customer_sim = CustomerSimulator(
@@ -213,6 +234,9 @@ def cmd_new_session(args, base: Path):
 
     # Save protected DB (in-memory → obfuscated .nmdb)
     nmdb_path = _session_nmdb_path(base, session_id)
+    initialize_integrity(conn)
+    write_checkpoint(conn, simulator)
+    conn.commit()
     save_session_db(conn, nmdb_path)
     conn.close()
 
@@ -231,8 +255,11 @@ def cmd_new_session(args, base: Path):
         "created_at": time.time(),
         "status": "created",
         "simulator_llm": simulator_llm,
+        "cash": args.cash,
+        "ledger_day": 0,
+        "integrity_version": 1,
     }
-    _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
+    atomic_json(_session_meta_path(base, session_id), meta)
 
     # Initialize empty history
     _session_history_path(base, session_id).write_text("")
@@ -248,179 +275,100 @@ def cmd_new_session(args, base: Path):
     print(json.dumps(result, indent=2))
 
 
+class _NoPublicInternals(io.TextIOBase):
+    """Never emit simulator diagnostics/LLM payloads into agent-readable logs."""
+    def write(self, value):
+        return len(value)
+    def flush(self):
+        pass
+
+
 def cmd_start_server(args, base: Path):
-    """Start the API server for a session (runs in foreground)."""
+    """Start exactly one server; resume only a fully committed request boundary."""
     session_id = _resolve_session(base, args.session)
     sdir = _session_dir(base, session_id)
-
-    # Load session metadata
-    meta = json.loads(_session_meta_path(base, session_id).read_text())
-    seed = meta["seed"]
-    total_days = meta["total_days"]
-
-    # Load protected DB into memory (no plain SQLite on disk)
-    nmdb_path = _session_nmdb_path(base, session_id)
-
-    if not nmdb_path.exists():
-        print(f"Error: Session database not found: {nmdb_path}", file=sys.stderr)
-        sys.exit(1)
-
-    conn = load_session_db(nmdb_path)
-
-    # Refresh planner stats on the loaded DB. Without this, the planner picks a
-    # nested-loop plan for the open_issues dashboard query (scans 166k active subs
-    # × ~63k filtered customer_state rows → 200+ seconds). After ANALYZE, it picks
-    # an rowid lookup on customer_state and the same query runs in ~10 ms.
-    conn.execute("ANALYZE")
-
-    # Run pending migrations on the loaded DB (load_session_db skips init_database)
+    lock = open(sdir / '.server.lock', 'a+')
     try:
-        conn.execute("ALTER TABLE agent_social_media_posts ADD COLUMN reasoning_by_group TEXT NOT NULL DEFAULT '{}'")
-    except Exception:
-        pass  # Column already exists
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({'success': False, 'error': 'server_already_starting_or_running'}))
+        return
+    meta_path = _session_meta_path(base, session_id)
+    meta = json.loads(meta_path.read_text())
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = sys.stderr = _NoPublicInternals()
+    try:
+        nmdb_path = _session_nmdb_path(base, session_id)
+        # Keep every journal write encrypted and durable without full-DB exports.
+        conn = load_session_db(nmdb_path, in_memory=False)
+        conn.execute('PRAGMA synchronous=FULL')
+        state = read_checkpoint(conn)  # Pending/missing state fails closed.
+        config = state['config']
+        _apply_simulator_llm_config(config)
+        rng = Generator(PCG64(meta['seed']))
+        customer_sim = CustomerSimulator(client=_create_simulator_openai_client(config), conn=conn, config=config)
+        simulator = Simulator(conn, config, rng, customer_simulator=customer_sim)
+        simulator.initialize(resume=True)
+        # Fresh constructor initializes runtime references; saved state replaces
+        # all process-local caches and RNGs, including customer quality noise.
+        workspace = _session_workspace(base, session_id)
+        tools = AgentTools(conn, state['tool_day'], workspace, rng=rng, config=config, seed=meta['seed'])
+        scenario_pack = SCENARIO_PACKS.get(meta.get('scenario', 'default'), ScenarioPack(name='Default', description='Balanced scenario'))
+        shock_manager = ShockManager(conn, rng, scenario_pack)
+        restore_runtime(state, simulator, tools, shock_manager)
+        api_server = NovaMindAPIServer(tools=tools, simulator=simulator, conn=conn, shock_manager=shock_manager)
+        api_server.journal = RequestJournal(conn, lambda: write_checkpoint(conn, simulator, tools, shock_manager))
+        api_server.refresh_committed_status()
 
-    # Reconstruct simulator state
-    rng = Generator(PCG64(seed))
-    config = BenchmarkConfig(
-        seed=seed,
-        total_days=total_days,
-        initial_cash=meta["initial_cash"],
-    )
-    _restore_simulator_llm_config(config, meta)
-    meta["simulator_llm"] = _apply_simulator_llm_config(config)
+        def publish_status():
+            snapshot = api_server._committed_status
+            meta.update(current_day=snapshot['day'], ledger_day=snapshot['day'],
+                        cash=snapshot['cash'], snapshot_at=snapshot['snapshot_at'],
+                        status='running', integrity_version=1)
+            atomic_json(meta_path, meta)
 
-    customer_sim = CustomerSimulator(
-        client=_create_simulator_openai_client(config),
-        conn=conn,
-        config=config,
-    )
-    simulator = Simulator(conn, config, rng, customer_simulator=customer_sim)
-    simulator.initialize(resume=True)  # resume=True: skip DB writes, just set up _group_rngs
-    current_day = meta.get("current_day", 0)
+        def publish_failure():
+            meta.update(status='unrecoverable', error='incomplete_mutation_or_checkpoint_failure')
+            atomic_json(meta_path, meta)
+        api_server.failure_callback = publish_failure
+        api_server.commit_callback = publish_status
+        api_server.start()
+        tools.api_port = api_server.port
+        _pid_file(base, session_id).write_text(str(os.getpid()))
+        _port_file(base, session_id).write_text(str(api_server.port))
+        meta.update(port=api_server.port, pid=os.getpid())
+        publish_status()
+        original_stdout.write(json.dumps({'session_id': session_id, 'port': api_server.port, 'pid': os.getpid(), 'status': 'running'}) + '\n')
+        original_stdout.flush()
+        shutdown_requested = False
 
-    # Restore RNG states from database for deterministic resume
-    if current_day > 0:
-        simulator.current_day = current_day
-        if not simulator.restore_rng_states():
-            print(f"WARNING: No saved RNG states found — RNG will NOT match continuous run", file=sys.stderr)
-
-    workspace = _session_workspace(base, session_id)
-    tools = AgentTools(conn, current_day, workspace, rng=rng, config=config, seed=seed)
-
-    # Shock manager for world events
-    scenario_name = meta.get("scenario", "default")
-    scenario_pack = SCENARIO_PACKS.get(scenario_name, ScenarioPack(
-        name='Default', description='Balanced scenario'
-    ))
-    shock_manager = ShockManager(conn, rng, scenario_pack)
-
-    # Event logger
-    logs_dir = sdir / "logs"
-    logs_dir.mkdir(exist_ok=True)
-    event_logger = EventLogger(
-        run_id=session_id,
-        output_dir=logs_dir,
-        seed=seed,
-        scenario="default",
-        config={"seed": seed, "total_days": total_days},
-    )
-    simulator.set_event_logger(event_logger)
-    tools.set_event_logger(event_logger)
-
-    # History logging callback
-    history_path = _session_history_path(base, session_id)
-
-    def _log_history(entry: dict):
-        with open(history_path, "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-
-    # Async encrypter for the per-day save. The hot path snapshots the
-    # in-memory conn to a plain tmp file (~10s on 1.5 GB) and submits it;
-    # the worker thread does the ~90s encrypt + atomic-replace off the
-    # next-week response path. Drained on shutdown.
-    async_saver = AsyncSaver(nmdb_path)
-
-    # Day callback — save state after each day
-    def _day_callback(day, dashboard):
-        meta["current_day"] = day
-        meta["status"] = "running"
-        _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
-        # Snapshot synchronously, queue encrypt to background worker.
-        plain = snapshot_to_plain(conn, nmdb_path.parent)
-        async_saver.submit(plain)
-        # Log to history
-        _log_history({"type": "next_week", "day": day, "timestamp": time.time()})
-
-    # Create and start API server
-    api_server = NovaMindAPIServer(
-        tools=tools,
-        simulator=simulator,
-        conn=conn,
-        day_callback=_day_callback,
-        shock_manager=shock_manager,
-        event_logger=event_logger,
-    )
-    api_server.start()
-
-    # Set API port on tools so Python sandbox routes queries through HTTP
-    tools.api_port = api_server.port
-
-    # Write PID and port files
-    _pid_file(base, session_id).write_text(str(os.getpid()))
-    _port_file(base, session_id).write_text(str(api_server.port))
-
-    # Update metadata
-    meta["status"] = "running"
-    meta["port"] = api_server.port
-    meta["pid"] = os.getpid()
-    _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
-
-    # Print server info
-    info = {
-        "session_id": session_id,
-        "port": api_server.port,
-        "pid": os.getpid(),
-        "status": "running",
-    }
-    print(json.dumps(info))
-    sys.stdout.flush()
-
-    # Handle shutdown gracefully
-    shutdown_requested = False
-
-    def _shutdown(signum, frame):
-        nonlocal shutdown_requested
-        if shutdown_requested:
-            return
-        shutdown_requested = True
+        def _shutdown(signum, frame):
+            nonlocal shutdown_requested
+            shutdown_requested = True
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+        while not shutdown_requested:
+            time.sleep(0.1)
+        # Wait for the active request rather than saving partially stepped state.
         api_server.stop()
-        # Drain the async encrypter, then write a fresh synchronous save so
-        # any post-day-callback writes (agent tool calls between days) land
-        # before exit.
-        try:
-            async_saver.shutdown(wait=True, timeout=180.0)
-        except Exception:
-            pass
-        save_session_db(conn, nmdb_path)
-        meta["status"] = "stopped"
-        meta.pop("port", None)
-        meta.pop("pid", None)
-        _session_meta_path(base, session_id).write_text(json.dumps(meta, indent=2))
-        # Clean up PID/port files
-        for f in [_pid_file(base, session_id), _port_file(base, session_id)]:
-            if f.exists():
-                f.unlink()
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-
-    # Keep running until killed
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        _shutdown(None, None)
+        with api_server._lock:
+            pending = conn.execute("SELECT 1 FROM _request_journal WHERE status!='completed' LIMIT 1").fetchone()
+            meta['status'] = 'unrecoverable' if pending else 'stopped'
+            meta.pop('port', None)
+            meta.pop('pid', None)
+            atomic_json(meta_path, meta)
+            conn.close()
+    except Exception:
+        meta['status'] = 'unrecoverable'
+        meta['error'] = 'unsafe_resume_or_checkpoint_failure'
+        atomic_json(meta_path, meta)
+        original_stderr.write('Unrecoverable session. Stop this agent run; do not replay or create a replacement game.\n')
+        raise SystemExit(1)
+    finally:
+        for path in (_pid_file(base, session_id), _port_file(base, session_id)):
+            path.unlink(missing_ok=True)
+        sys.stdout, sys.stderr = original_stdout, original_stderr
+        lock.close()
 
 
 def cmd_stop_server(args, base: Path):
@@ -435,7 +383,10 @@ def cmd_stop_server(args, base: Path):
     pid = int(pid_path.read_text().strip())
     try:
         os.kill(pid, signal.SIGTERM)
-        print(json.dumps({"success": True, "stopped_pid": pid}))
+        from saas_bench.session_integrity import wait_for_exit
+        stopped = wait_for_exit(pid)
+        print(json.dumps({'success': stopped, 'stopped_pid': pid if stopped else None,
+                          'error': None if stopped else 'stop_pending_active_request'}))
     except ProcessLookupError:
         # Already dead, clean up
         pid_path.unlink(missing_ok=True)

@@ -5,7 +5,7 @@ description = "SaaS Bench - AI subscription service benchmark"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "anthropic>=0.109.1",
+    "anthropic[bedrock]==0.79.0",
     "boto3>=1.42.41",
     "cryptography>=46.0.3",
     "fastapi>=0.133.1",
@@ -13,18 +13,19 @@ dependencies = [
     "matplotlib>=3.10.8",
     "mcp>=1.0.0",
     "modal>=1.4.2",
-    "numpy>=2.4.1",
-    "openai>=2.15.0",
-    "pandas>=2.3.3",
+    "numpy==2.4.1",
+    "openai==2.15.0",
+    "pandas==2.3.3",
     "portkey-ai>=2.3.0",
     "pydantic>=2.12.5",
-    "python-dotenv>=1.2.1",
+    "python-dotenv==1.2.1",
     "reportlab>=4.4.9",
     "requests>=2.32.5",
-    "scikit-learn>=1.8.0",
+    "scikit-learn==1.8.0",
+    "scipy==1.17.0",
     # sqlcipher3-binary ships prebuilt wheels for Linux x86_64 only; sqlcipher3
     # ships them for macOS + Windows. Split by platform so both get a wheel.
-    "sqlcipher3-binary>=0.6.0 ; sys_platform == 'linux'",
+    "sqlcipher3-binary==0.6.0 ; sys_platform == 'linux'",
     "sqlcipher3>=0.6.2 ; sys_platform != 'linux'",
     "uvicorn>=0.40.0",
     "weasyprint>=68.0",

@@ -1,6 +1,7 @@
 """HTTP client for communicating with the NovaMind API server."""
 
 import json
+import uuid
 import os
 import sys
 import urllib.request
@@ -37,7 +38,7 @@ def _base_url() -> str:
     return f"http://127.0.0.1:{_get_port()}"
 
 
-def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def call(tool_name: str, args: Optional[Dict[str, Any]] = None, *, request_id: Optional[str] = None) -> Dict[str, Any]:
     """Call a tool on the API server and return the result.
 
     Args:
@@ -51,7 +52,8 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         NovaMindAPIError: On failure (also prints to stderr)
     """
     url = f"{_base_url()}/call"
-    payload = json.dumps({"tool": tool_name, "args": args or {}}).encode()
+    request_id = request_id or uuid.uuid4().hex
+    payload = json.dumps({"tool": tool_name, "args": args or {}, "request_id": request_id}).encode()
 
     req = urllib.request.Request(
         url,
@@ -64,7 +66,7 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
     except urllib.error.URLError as e:
-        raise NovaMindAPIError(f"Failed to connect to API server: {e}")
+        raise NovaMindAPIError(f"Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.")
     except json.JSONDecodeError as e:
         raise NovaMindAPIError(f"Invalid JSON response: {e}")
 
@@ -75,7 +77,7 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     return result.get('data', {})
 
 
-def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict[str, Any]:
+def next_week(predictions: Dict[str, Any] = None, rationale: str = None, *, request_id: Optional[str] = None) -> Dict[str, Any]:
     """Advance the simulator by one week (7 days).
 
     Args:
@@ -113,7 +115,9 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
             "upper": float(p["upper"]),
         }
 
+    request_id = request_id or uuid.uuid4().hex
     body = json.dumps({
+        "request_id": request_id,
         "rationale": rationale,
         "predictions": {
             "cash_1wk":  _entry(predictions["cash_1wk"]),
@@ -143,7 +147,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None) -> Dict
             error_msg = f"HTTP {e.code}: {body.decode('utf-8', errors='replace')[:500]}"
         raise NovaMindAPIError(error_msg)
     except urllib.error.URLError as e:
-        raise NovaMindAPIError(f"Failed to connect to API server: {e}")
+        raise NovaMindAPIError(f"Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.")
 
     if not result.get('success', False):
         error_msg = result.get('error', 'Unknown error')

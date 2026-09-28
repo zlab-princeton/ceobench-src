@@ -3949,12 +3949,12 @@ os.chdir('{self.workspace_path}')
             else:
                 summary.append(f"Day {p['day']}: \"{p['content'][:80]}\"")
 
-        # Strip hidden fields from returned data
-        _hidden_post_keys = {'sentiment', 'likes', 'shares', 'virality_score',
-                             'customer_id', 'reputation_impact', 'influence_score'}
+        # Share the SQL/public-doc allowlist; future internal fields fail closed.
+        from .public_query import PUBLIC_COLUMNS
+        public_post_keys = PUBLIC_COLUMNS['social_media_posts']
         clean_posts = []
         for p in posts:
-            post_data = {k: v for k, v in p.items() if k not in _hidden_post_keys}
+            post_data = {k: v for k, v in p.items() if k in public_post_keys}
             # Include agent post content for replies
             apid = p.get('reply_to_agent_post_id')
             if apid and apid in agent_post_content:

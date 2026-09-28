@@ -3,6 +3,7 @@
   "description": "Enterprise negotiation turns \u2014 each row is one message in a conversation. message_id is the unique identifier for each message.",
   "columns": {
     "message_id": "INTEGER PRIMARY KEY \u2014 Unique message identifier (use this to reference messages in send_enterprise_deal/reject_enterprise_deal)",
+    "thread_id": "INTEGER \u2014 Conversation identifier grouping related messages; use message_id when responding to a message",
     "customer_id": "INTEGER \u2014 Foreign key to customers",
     "thread_type": "TEXT \u2014 'new_lead', 'plan_change', 'churn_prevention', 'renegotiation', 'renewal', 'general'",
     "turn_number": "INTEGER \u2014 0-indexed turn within thread",

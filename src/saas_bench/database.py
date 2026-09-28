@@ -1,6 +1,7 @@
 """Database schema and operations for SaaS Bench."""
 
 import sqlite3
+import sqlcipher3
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 import json
@@ -147,6 +148,7 @@ TABLE_DOCS = {
         'columns': {
             'post_id': 'INTEGER PRIMARY KEY — Unique post ID',
             'day': 'INTEGER — Day posted',
+            'reply_to_agent_post_id': 'INTEGER — Agent post this customer post replies to (NULL for an original post)',
             'content': 'TEXT — Post content text',
         },
         'internal_columns': {
@@ -190,6 +192,7 @@ TABLE_DOCS = {
         'description': 'Enterprise negotiation turns — each row is one message in a conversation. message_id is the unique identifier for each message.',
         'columns': {
             'message_id': 'INTEGER PRIMARY KEY — Unique message identifier (use this to reference messages in send_enterprise_deal/reject_enterprise_deal)',
+            'thread_id': 'INTEGER — Conversation identifier grouping related messages; use message_id when responding to a message',
             'customer_id': 'INTEGER — Foreign key to customers',
             'thread_type': "TEXT — 'new_lead', 'plan_change', 'churn_prevention', 'renegotiation', 'renewal', 'general'",
             'turn_number': 'INTEGER — 0-indexed turn within thread',
@@ -317,10 +320,11 @@ TABLE_DOCS = {
 }
 
 
-def init_database(db_path: Path) -> sqlite3.Connection:
+def init_database(db_path: Path, *, connection=None) -> sqlite3.Connection:
     """Initialize the world database with all required tables."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    conn = connection if connection is not None else sqlite3.connect(db_path)
+    if connection is None:
+        conn.row_factory = sqlite3.Row
 
     # Enable foreign keys
     conn.execute("PRAGMA foreign_keys = ON")
@@ -1056,7 +1060,7 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     for col in ('predicted_lower', 'predicted_upper'):
         try:
             conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} REAL")
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlcipher3.OperationalError):
             pass  # Column already exists
 
     # V2.3 migration: ads system + promotion system columns
@@ -1066,7 +1070,7 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     ]:
         try:
             conn.execute(f"ALTER TABLE customers ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlcipher3.OperationalError):
             pass  # Column already exists
     for col, col_type in [
         ('promotion', 'REAL NOT NULL DEFAULT 0.0'),
@@ -1076,31 +1080,31 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     ]:
         try:
             conn.execute(f"ALTER TABLE subscriptions ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlcipher3.OperationalError):
             pass  # Column already exists
 
     # Migration: add reply_to_agent_post_id to social_media_posts
     try:
         conn.execute("ALTER TABLE social_media_posts ADD COLUMN reply_to_agent_post_id INTEGER")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, sqlcipher3.OperationalError):
         pass  # Column already exists
 
     # Migration: add reasoning_by_group to agent_social_media_posts
     try:
         conn.execute("ALTER TABLE agent_social_media_posts ADD COLUMN reasoning_by_group TEXT NOT NULL DEFAULT '{}'")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, sqlcipher3.OperationalError):
         pass  # Column already exists
 
     # Migration: add comment_post_ids to agent_social_media_posts
     try:
         conn.execute("ALTER TABLE agent_social_media_posts ADD COLUMN comment_post_ids TEXT NOT NULL DEFAULT '[]'")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, sqlcipher3.OperationalError):
         pass  # Column already exists
 
     # Migration: add source_group_id to social_media_posts (actual group for market_observer fallback posts)
     try:
         conn.execute("ALTER TABLE social_media_posts ADD COLUMN source_group_id TEXT")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, sqlcipher3.OperationalError):
         pass  # Column already exists
 
     # v3.4ai migration: per-event sampled vs feedback breakdown on competitor_events
@@ -1113,14 +1117,14 @@ def init_database(db_path: Path) -> sqlite3.Connection:
     ]:
         try:
             conn.execute(f"ALTER TABLE competitor_events ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
+        except (sqlite3.OperationalError, sqlcipher3.OperationalError):
             pass  # Column already exists
 
     # L8 migration: drop redundant daily_usage day index (PK already covers it)
     # and ensure new active-thread partial index exists on existing databases
     try:
         conn.execute("DROP INDEX IF EXISTS idx_daily_usage_day")
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, sqlcipher3.OperationalError):
         pass
 
     # L9: Run ANALYZE so SQLite query planner picks optimal indexes.

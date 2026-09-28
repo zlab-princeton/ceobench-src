@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from .tools import TOOL_DOCS
-from .database import TABLE_DOCS
+from .public_query import PUBLIC_TABLE_DOCS as TABLE_DOCS
 
 
 # Tools excluded from the novamind_api (not exposed to bash_agent)
@@ -130,7 +130,7 @@ def initialize_workspace(workspace_path: Path):
 
     Creates:
         workspace_path/
-            daily_scripts/    — Auto-executed scripts directory
+            daily_scripts/    — Reserved (automatic execution is unsupported)
 
     Args:
         workspace_path: Per-session scratch root for the agent.

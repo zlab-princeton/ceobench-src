@@ -761,8 +761,8 @@ def get_threads_needing_reply(conn: sqlite3.Connection, current_day: int) -> Lis
             SELECT thread_id FROM (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY message_id DESC) AS rn
                 FROM enterprise_turns
-                WHERE closed = 0 AND _internal_status IS NULL
-            ) WHERE rn = 1 AND next_reply_day = ?
+            ) WHERE rn = 1 AND closed = 0 AND _internal_status IS NULL
+                AND next_reply_day = ?
         """, (current_day,)).fetchall()
 
     return [row['thread_id'] for row in rows]

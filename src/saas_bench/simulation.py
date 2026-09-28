@@ -4588,14 +4588,11 @@ class Simulator:
         from .personas import GROUP_CHARACTERISTICS
         from .customer_llm import judge_agent_social_post, generate_customer_reply_to_agent
 
-        _debug_log = "/tmp/social_reply_debug.log"
 
-        with open(_debug_log, "a") as _df:
-            _df.write(f"[ENTER] _process_agent_social_posts day={self.current_day}, has_cs={bool(self.customer_simulator)}\n")
+        pass  # Hidden judge diagnostics must never enter agent-readable files.
 
         if not self.customer_simulator:
-            with open(_debug_log, "a") as _df:
-                _df.write(f"  SKIP: no customer_simulator\n")
+            pass  # Hidden judge diagnostics must never enter agent-readable files.
             return
 
         # Get all unscored agent posts (effect_by_group == '{}')
@@ -4607,8 +4604,7 @@ class Simulator:
             WHERE effect_by_group = '{}'
         """).fetchall()
 
-        with open(_debug_log, "a") as _df:
-            _df.write(f"  unscored_posts={len(rows)}\n")
+        pass  # Hidden judge diagnostics must never enter agent-readable files.
 
         if not rows:
             return
@@ -4733,16 +4729,11 @@ class Simulator:
             # Send inbox notification about post performance
             try:
                 truncated = content[:80] + ('...' if len(content) > 80 else '')
-                avg_effect = sum(effect_by_group.values()) / len(effect_by_group) if effect_by_group else 0.0
-                sentiment_word = 'positively' if avg_effect > 0.1 else ('negatively' if avg_effect < -0.1 else 'neutrally')
-                top_groups = sorted(effect_by_group.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
-                top_str = ', '.join(f'{g}: {e:+.1f}' for g, e in top_groups)
                 notif_msg = (f'Your social media post received {total_views:,} views: "{truncated}" '
-                             f'— Received {sentiment_word} overall. Top reactions: {top_str}')
+                             f'— Read customer comments for public reactions.')
                 add_notification(self.conn, self.current_day, 'social_media', notif_msg)
             except Exception as _ne:
-                with open("/tmp/social_reply_debug.log", "a") as _df:
-                    _df.write(f"  NOTIF_ERR: {_ne}\n{_tb.format_exc()}\n")
+                pass  # Hidden judge diagnostics must never enter agent-readable files.
 
             # Generate customer replies for viral reactions
             reply_futures = {}
@@ -4752,8 +4743,7 @@ class Simulator:
             ]
             comment_post_ids = []  # Collect post_ids of customer comments on this agent post
 
-            with open(_debug_log, "a") as _df:
-                _df.write(f"[{self.current_day}] Post {post_id}: viral_groups={viral_groups}, effects={effect_by_group}\n")
+            pass  # Hidden judge diagnostics must never enter agent-readable files.
 
             if viral_groups:
                 with ThreadPoolExecutor(max_workers=min(len(viral_groups), 6)) as executor:
@@ -4815,16 +4805,14 @@ class Simulator:
                             )
                             comment_post_ids.append(comment_pid)
 
-                            with open(_debug_log, "a") as _df:
-                                _df.write(f"  OK: {gid} -> post_id={comment_pid}, cust={customer_id}\n")
+                            pass  # Hidden judge diagnostics must never enter agent-readable files.
 
                             self.customer_simulator._log_cost(
                                 self.current_day, 'agent_social_reply',
                                 in_tok, out_tok, model=social_model
                             )
                         except Exception as _e:
-                            with open(_debug_log, "a") as _df:
-                                _df.write(f"  FAIL: {gid}: {_e}\n{_tb.format_exc()}\n")
+                            pass  # Hidden judge diagnostics must never enter agent-readable files.
 
             # Store comment post IDs on the agent post
             if comment_post_ids:
@@ -5912,8 +5900,7 @@ Guidelines:
             FROM (
                 SELECT *, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY message_id DESC) AS rn
                 FROM enterprise_turns
-                WHERE _internal_status IS NULL
-            ) WHERE rn = 1 AND closed = 0
+            ) WHERE rn = 1 AND closed = 0 AND _internal_status IS NULL
         """)
         _ent_timings['latest_turns_cache'] = _time.monotonic() - _t0
 

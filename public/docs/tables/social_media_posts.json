@@ -4,6 +4,7 @@
   "columns": {
     "post_id": "INTEGER PRIMARY KEY \u2014 Unique post ID",
     "day": "INTEGER \u2014 Day posted",
+    "reply_to_agent_post_id": "INTEGER \u2014 Agent post this customer post replies to (NULL for an original post)",
     "content": "TEXT \u2014 Post content text"
   }
 }

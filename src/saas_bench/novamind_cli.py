@@ -251,28 +251,9 @@ def novamind_main():
         novamind list-daily-scripts
         novamind remove-daily-script strategy.py
     """
-    parser = argparse.ArgumentParser(
-        prog='novamind',
-        description='NovaMind daily script management',
-    )
-    subparsers = parser.add_subparsers(dest='command', required=True)
-
-    # register-daily-script
-    sub_reg = subparsers.add_parser('register-daily-script', help='Register a daily script')
-    sub_reg.add_argument('script_path', help='Path to the Python script')
-    sub_reg.set_defaults(func=_cmd_register_daily_script)
-
-    # list-daily-scripts
-    sub_list = subparsers.add_parser('list-daily-scripts', help='List registered daily scripts')
-    sub_list.set_defaults(func=_cmd_list_daily_scripts)
-
-    # remove-daily-script
-    sub_rm = subparsers.add_parser('remove-daily-script', help='Remove a daily script')
-    sub_rm.add_argument('script_name', help='Filename of the script to remove')
-    sub_rm.set_defaults(func=_cmd_remove_daily_script)
-
-    args = parser.parse_args()
-    args.func(args)
+    print(json.dumps({'success': False, 'error': 'daily_scripts_unsupported',
+                      'message': 'Use novamind-operation python for explicit scripts.'}))
+    raise SystemExit(1)
 
 
 # =========================================================================
@@ -310,26 +291,6 @@ def get_cli_docs() -> str:
         lines.append(doc.strip())
         lines.append("")
 
-    lines.extend([
-        "## novamind",
-        "",
-        f"{novamind_main.__doc__}",
-        "",
-        "### Commands",
-        "",
-    ])
-
-    # novamind commands
-    nm_commands = [
-        ("register-daily-script", _cmd_register_daily_script),
-        ("list-daily-scripts", _cmd_list_daily_scripts),
-        ("remove-daily-script", _cmd_remove_daily_script),
-    ]
-    for name, func in nm_commands:
-        doc = func.__doc__ or "No documentation."
-        lines.append(f"#### `novamind {name}`")
-        lines.append("")
-        lines.append(doc.strip())
-        lines.append("")
+    lines.extend(["Automatic daily scripts are unsupported. Run scripts explicitly with novamind-operation python."])
 
     return "\n".join(lines)

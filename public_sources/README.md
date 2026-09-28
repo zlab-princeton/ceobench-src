@@ -9,11 +9,29 @@ You must do whatever you can to maximize ending cash at the end of day 500. You 
 You drive the simulator entirely through the `./novamind-operation` CLI in this
 directory. There is no other interface.
 
-Do not stop until you bankrupt or complete all 500 days of simulations.
+Continue until bankruptcy or completion, unless the existing game cannot safely resume as described below.
 
 You can use your filesystem to write scripts / maintain memory in anyway you like.
 
-You are only allowed to play it once (one create-session allowed). The task is very difficult. Make sure you observe, analyze, act, advance a week, and observe, analyze, act again before advancing another week.
+You are only allowed to play it once (one `new-session` allowed).
+
+**One game only.** Create exactly one simulation session. Never create a
+replacement session, reset the game, restore an older checkpoint, or replay an
+earlier turn. If execution is interrupted, resume only that same session through
+`./novamind-operation resume`. Resume must preserve committed progress and
+already-submitted actions. If resume reports an unrecoverable interruption, stop
+immediately, report the session ID, last confirmed day and cash, and the failure,
+then end your agent process normally. **Do not start another game.**
+
+Do not manually kill or restart simulator processes, modify session files, or
+retry a mutating request whose outcome is unknown. Check its request status
+instead. A slow advance is not a failed advance. Do not change runtime packages,
+credentials, model routing, or infrastructure during gameplay.
+
+Use only documented public observations. Internal event logs and private
+checkpoint files are not an additional observation interface.
+
+ The task is very difficult. Make sure you observe, analyze, act, advance a week, and observe, analyze, act again before advancing another week.
 
 ---
 
@@ -40,7 +58,7 @@ zipapp); `requirements.txt` only installs the third-party libraries the engine
 imports at runtime (`numpy`, `pandas`, `scikit-learn`, `openai`, `anthropic`,
 `sqlcipher3-binary`, `python-dotenv`).
 
-Requires Python 3.13+.
+Requires Python 3.13 (the bundled bytecode is built for this version).
 
 ---
 

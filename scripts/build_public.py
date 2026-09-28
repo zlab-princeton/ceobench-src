@@ -23,6 +23,9 @@ Usage:
 """
 
 import os
+import hashlib
+import json
+import platform
 import py_compile
 import shutil
 import stat
@@ -56,7 +59,9 @@ _ENGINE_MODULES = [
     "llm_replay",
     "novamind_cli",
     "personas",
+    "public_query",
     "server_entry",
+    "session_integrity",
     "shocks",
     "simulation",
     "tools",
@@ -154,6 +159,9 @@ def build():
     print(f"✅ Table docs: {len(table_files)} tables")
     print(f"✅ CLI docs: docs/cli.md")
 
+    subprocess.run([sys.executable, str(PROJECT_ROOT / "scripts/generate_public_docs.py"),
+                    "--output", str(docs_dir)], cwd=PROJECT_ROOT, check=True)
+
     # ── Step 3: Build the novamind-operation zipapp ──
     step("3. Building novamind-operation zipapp")
     _build_zipapp()
@@ -184,6 +192,18 @@ def build():
             stale_path.unlink()
             print(f"  Removed {stale_name}")
 
+    files = {str(p.relative_to(PUBLIC_DIR)): hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in sorted(PUBLIC_DIR.rglob("*")) if p.is_file()
+             and p.name != "release-manifest.json" and "__pycache__" not in p.parts}
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True).strip()
+    (PUBLIC_DIR / "release-manifest.json").write_text(json.dumps({
+        "source_revision": revision, "python": platform.python_version(),
+        "source_tree_sha256": hashlib.sha256(b"".join(
+            str(p.relative_to(PROJECT_ROOT)).encode() + b"\0" + p.read_bytes()
+            for p in sorted(SRC_DIR.rglob("*.py")))).hexdigest(),
+        "files_sha256": files,
+    }, indent=2) + "\n")
+
     # ── Step 5: Summary ──
     step("5. Build complete")
     print(f"public/ contents:")
@@ -210,7 +230,7 @@ def _build_zipapp():
                 *.pyc
                 novamind_api/*.pyc
     """
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(prefix=".build-public-", dir=PROJECT_ROOT) as tmp:
         staging = Path(tmp) / "stage"
         staging.mkdir()
 
