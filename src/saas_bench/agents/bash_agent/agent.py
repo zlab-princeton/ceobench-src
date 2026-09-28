@@ -26,6 +26,10 @@ class Message:
     tool_calls: Optional[List[Dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # Chain-of-thought returned with an assistant turn, replayed on subsequent
+    # requests. Only used by the chat-completions path; the Responses API
+    # carries reasoning items in `content` and round-trips them already.
+    reasoning_content: Optional[str] = None
 
 
 # Regex to detect dashboard in bash output (day advancement)
@@ -349,6 +353,7 @@ class BashAgent(BaseAgent):
             "tool_calls": m.tool_calls,
             "tool_call_id": m.tool_call_id,
             "name": m.name,
+            "reasoning_content": m.reasoning_content,
         }
 
     def _save_conversation_snapshot(self) -> None:
@@ -407,6 +412,7 @@ class BashAgent(BaseAgent):
                     tool_calls=m.get("tool_calls"),
                     tool_call_id=m.get("tool_call_id"),
                     name=m.get("name"),
+                    reasoning_content=m.get("reasoning_content"),
                 ))
 
             def _has_in_flight_tool_call(msg: "Message") -> bool:
@@ -483,6 +489,14 @@ class BashAgent(BaseAgent):
                     m['name'] = msg.name
                 if msg.tool_calls:
                     m['tool_calls'] = msg.tool_calls
+                if msg.reasoning_content:
+                    # Replay prior-turn reasoning. Reasoning models that expose a
+                    # think channel in their chat template render that channel
+                    # structurally on every assistant turn, filling it from this
+                    # field. When the field is absent the channel is still
+                    # rendered, just empty — the history then shows a model that
+                    # reasoned about nothing, and later turns imitate it.
+                    m['reasoning_content'] = msg.reasoning_content
                 messages.append(m)
 
             tools = [
@@ -626,7 +640,8 @@ class BashAgent(BaseAgent):
                 self.conversation.append(Message(
                     role='assistant',
                     content=assistant_msg.content or '',
-                    tool_calls=tool_calls_data
+                    tool_calls=tool_calls_data,
+                    reasoning_content=reasoning_content or None,
                 ))
 
                 if not assistant_msg.tool_calls:
