@@ -2202,6 +2202,23 @@ class AgentTools:
             by_group_plan: {group_id: {plan: $/day}}. Intersection of group + plan.
             by_customer: {customer_id_str: $/day}. Single-customer boost (like promotion).
         """
+        import math
+
+        def valid_amount(amount):
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                return False
+            try:
+                return math.isfinite(amount) and amount >= 0
+            except OverflowError:
+                return False
+
+        # Validate into local values before updating any scope. A bad later
+        # scope must not partially apply an otherwise rejected request.
+        g = self.config.targeted_ops_spend
+        p = self.config.targeted_ops_spend_by_plan
+        gp = self.config.targeted_ops_spend_by_group_plan
+        c = self.config.targeted_ops_spend_by_customer
+
         # Legacy alias: targeted_spend == by_group
         if targeted_spend is not None and by_group is None:
             by_group = targeted_spend
@@ -2219,9 +2236,9 @@ class AgentTools:
             if invalid:
                 return ToolResult(False, f"Invalid group IDs: {invalid}. Valid: {sorted(valid_groups)}")
             for gid, amt in by_group.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
-                    return ToolResult(False, f"Amount for {gid} must be a non-negative number")
-            self.config.targeted_ops_spend = {k: float(v) for k, v in by_group.items()}
+                if not valid_amount(amt):
+                    return ToolResult(False, f"Amount for {gid} must be a finite non-negative number")
+            g = {k: float(v) for k, v in by_group.items()}
 
         # ── by_plan ──
         if by_plan is not None:
@@ -2231,9 +2248,9 @@ class AgentTools:
             if invalid_plans:
                 return ToolResult(False, f"Invalid plans: {invalid_plans}. Valid: {sorted(valid_plans)}")
             for plan, amt in by_plan.items():
-                if not isinstance(amt, (int, float)) or amt < 0:
-                    return ToolResult(False, f"Amount for plan {plan} must be a non-negative number")
-            self.config.targeted_ops_spend_by_plan = {k: float(v) for k, v in by_plan.items()}
+                if not valid_amount(amt):
+                    return ToolResult(False, f"Amount for plan {plan} must be a finite non-negative number")
+            p = {k: float(v) for k, v in by_plan.items()}
 
         # ── by_group_plan ──
         if by_group_plan is not None:
@@ -2251,11 +2268,11 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plans for group {gid}: {bad_plans}. Valid: {sorted(valid_plans)}")
                 inner: Dict[str, float] = {}
                 for plan, amt in plans_dict.items():
-                    if not isinstance(amt, (int, float)) or amt < 0:
-                        return ToolResult(False, f"Amount for {gid}/{plan} must be a non-negative number")
+                    if not valid_amount(amt):
+                        return ToolResult(False, f"Amount for {gid}/{plan} must be a finite non-negative number")
                     inner[plan] = float(amt)
                 parsed_gp[gid] = inner
-            self.config.targeted_ops_spend_by_group_plan = parsed_gp
+            gp = parsed_gp
 
         # ── by_customer ──
         if by_customer is not None:
@@ -2264,24 +2281,30 @@ class AgentTools:
             parsed_c: Dict[int, float] = {}
             for k, amt in by_customer.items():
                 try:
+                    if isinstance(k, bool) or not isinstance(k, (int, str)):
+                        raise ValueError
                     cid = int(k)
+                    if cid <= 0:
+                        raise ValueError
                 except (ValueError, TypeError):
-                    return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(amt, (int, float)) or amt < 0:
-                    return ToolResult(False, f"Amount for customer {k} must be a non-negative number")
+                    return ToolResult(False, f"Customer ID '{k}' must be a positive integer")
+                if not valid_amount(amt):
+                    return ToolResult(False, f"Amount for customer {k} must be a finite non-negative number")
                 parsed_c[cid] = float(amt)
-            self.config.targeted_ops_spend_by_customer = parsed_c
+            c = parsed_c
 
-        # Summarise current state
-        g = self.config.targeted_ops_spend
-        p = self.config.targeted_ops_spend_by_plan
-        gp = self.config.targeted_ops_spend_by_group_plan
-        c = self.config.targeted_ops_spend_by_customer
+        # Summarise the fully validated prospective state.
         total_extra = (
             sum(g.values()) + sum(p.values())
             + sum(v for inner in gp.values() for v in inner.values())
             + sum(c.values())
         )
+        if not math.isfinite(total_extra):
+            return ToolResult(False, "Total targeted operations spend must be finite.")
+        self.config.targeted_ops_spend = g
+        self.config.targeted_ops_spend_by_plan = p
+        self.config.targeted_ops_spend_by_group_plan = gp
+        self.config.targeted_ops_spend_by_customer = c
         parts = []
         if g:
             parts.append("  Groups: " + ", ".join(f"{k}: +${v:.0f}/day" for k, v in g.items()))

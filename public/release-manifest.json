@@ -1,10 +1,10 @@
 {
-  "source_revision": "e0d49924ddc578edc177936ab6c69a9a9454b7ba",
+  "source_revision": "2cfff4f7b497a4624c65c1ba121c3746dc7fd2ac",
   "python": "3.13.5",
-  "source_tree_sha256": "649472aefb9772a4d6c2a2d66d12cf8afeaa3b8173c64c6e81caba4c30c1efe5",
+  "source_tree_sha256": "6e136c9f715ae610b6ed032b2ce267064e9e142f7bb27b52713a184c675d7621",
   "files_sha256": {
     ".gitignore": "da21fe60487d93d5c0c27da5d6f7dd5ef896f98e509069b866cd579f0b012a93",
-    "README.md": "8b365f2b905c4646f723ab3b14ee97e8b8770811e6e1cd3769ec4189469306db",
+    "README.md": "633954e8eb500f34729e675938de4d4e4d53e2d7f7428c5f79ba2006a9efa865",
     "docs/api/analytics.json": "d143d97129cbb70d04bf8392da2fd10a975673c82b16b9d5d540a23615a12d23",
     "docs/api/enterprise.json": "9f7b14f102d670b3d4d52c2704f6f9b80cc001dbf4cbad5129a6bfbbaf6d680a",
     "docs/api/infrastructure.json": "d46aa4ba5e3a7e07b4c7d9cef9bb8b64a9b06321965e596b1e1d444d4883eed0",
@@ -12,11 +12,11 @@
     "docs/api/marketing.json": "602782f5453488f573a5ba01ddd5d240f5b935fb3d8d7638f8fa422b71d3e773",
     "docs/api/pricing.json": "e2ab916d68cc1cbdc51d22382ce2cb73796dc6f514d002d21eece473ac5ecc6b",
     "docs/api/research.json": "8273747aa5778f8bf170cd63497c1650c2baacb6a5d318b32fafa784a3e0708b",
-    "docs/cli-reference.md": "ae066d5a7e8757b42198719bdf01ca87ea87e172de9688336b6694838f6bb58f",
+    "docs/cli-reference.md": "2deb962f2ffc4b0f2e826a8a15d8f487ae8b4bff846a8d84a8ff1dcf04b8aac6",
     "docs/cli.md": "621c9ee5c20c8756894615e0993fb6a05c29038f56649900bc407b4d6862b230",
     "docs/novamind_api/__init__.py": "0a2ffc338f785a41b462df82c74ca85c352724430b3c5e6a05d4b9b56679fd95",
-    "docs/novamind_api/_client.py": "ccebebc24c01d30937bb5ab9d7ca3c4cbd0d2d3a6bdb2bcbbbec3244274b9437",
-    "docs/novamind_api/analytics.py": "928e6943bbc1c2a387369df6a757a5e0a849cda1b2a92bb6109f0d3e1a5defd0",
+    "docs/novamind_api/_client.py": "c612cc7c8a89d26fd74e19108e0e032a9ae0f04c1630c7002f73f82a4e581281",
+    "docs/novamind_api/analytics.py": "e3fb2983b9562efdb7e1ebcbaab30dfd7d281543861114e80151b7658a323d81",
     "docs/novamind_api/enterprise.py": "0bf2fdfd764a424d693f2d29ec13106d126e95abcbb2e6d54c887fd4cbf83c8a",
     "docs/novamind_api/infrastructure.py": "f6f516129511685713b1a123d6b09d7a9250eee854a0ee2e088493260d85d75d",
     "docs/novamind_api/market.py": "efa2e7763d117632de828fc32c5af40ae6fee30210adf998262955fe4aa38c59",
@@ -45,7 +45,7 @@
     "docs/tables/subscriptions.json": "60bb4e24c77cc29b0564717001b3d1b74116f5ed575162be0ccf9cf035676d00",
     "docs/tables-reference.md": "9925e956d7992dc7b8cd1dd8d70309b77dc02da6c459d9f3b84f4b4b52192619",
     "docs/tools-reference.md": "ecac5001f25259de3a2b6a6380972ecd5c06eafe85f30b7ba30a8a6b04380a44",
-    "novamind-operation": "9276c6263bc277cc46f9edd5cc50841553265a5c4acfa63884d2040989130cf2",
+    "novamind-operation": "80c4b81bdba69f9499fc95c051affcc402d86266cd627587b7203cb1a5a894d7",
     "requirements.txt": "13ae40bfd8c978a3648b2ec68c8fc3bd9089e0ad33eff176440c2556a2f20191"
   }
 }

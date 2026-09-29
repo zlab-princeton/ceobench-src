@@ -99,6 +99,12 @@ PUBLIC_TABLE_DOCS = {
     for table, doc in TABLE_DOCS.items() if table not in _HIDDEN_TABLES
 }
 PUBLIC_COLUMNS = {table: frozenset(doc["columns"]) for table, doc in PUBLIC_TABLE_DOCS.items()}
+# SQLite identifiers are case-insensitive. Preserve documented spelling for
+# emitted views/docs, but normalize both sides of authorization comparisons.
+_AUTHORIZED_COLUMNS = {
+    table.lower(): frozenset(column.lower() for column in columns)
+    for table, columns in PUBLIC_COLUMNS.items()
+}
 
 
 def _quote(name):
@@ -123,8 +129,8 @@ def public_query_boundary(conn):
         for table, doc in PUBLIC_TABLE_DOCS.items():
             # Missing tables are not public views on an older schema. Crucially,
             # never expose any newly added column merely because it exists.
-            existing = {row[1] for row in conn.execute("PRAGMA main.table_info(" + _quote(table) + ")")}
-            columns = [col for col in doc["columns"] if col in existing]
+            existing = {row[1].lower() for row in conn.execute("PRAGMA main.table_info(" + _quote(table) + ")")}
+            columns = [col for col in doc["columns"] if col.lower() in existing]
             if not columns:
                 continue
             conn.execute("CREATE TEMP VIEW " + _quote(table) + " AS SELECT " +
@@ -137,9 +143,9 @@ def public_query_boundary(conn):
             if action == sqlite3.SQLITE_READ:
                 table = (first or "").lower()
                 column = (second or "").lower()
-                if database in ("main", "temp") and table in PUBLIC_COLUMNS:
+                if database in ("main", "temp") and table in _AUTHORIZED_COLUMNS:
                     # SQLite uses an empty column for COUNT(*) table reads.
-                    if not column or column in PUBLIC_COLUMNS[table]:
+                    if not column or column in _AUTHORIZED_COLUMNS[table]:
                         return sqlite3.SQLITE_OK
             if action == sqlite3.SQLITE_FUNCTION and (second or "").lower() in functions:
                 return sqlite3.SQLITE_OK

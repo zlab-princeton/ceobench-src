@@ -14,6 +14,7 @@ CLI and the ``novamind_api`` SDK source at ``docs/novamind_api/``.
 """
 
 import json
+import http.client
 import uuid
 import fcntl
 import os
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.parse
 import urllib.error
 from pathlib import Path
 
@@ -134,6 +136,8 @@ def _ensure_server_running(session_id: str, *, resume=False) -> int:
 
     meta = _session_meta(session_id)
     if meta.get('status') == 'unrecoverable':
+        if meta.get('error') == 'incompatible_checkpoint_engine_version':
+            raise SystemExit('Incompatible checkpoint engine version; cannot resume. Exit this agent run; do not create another game.')
         raise SystemExit('Unrecoverable session. Exit this agent run; do not start another game.')
     if meta.get('status') != 'created' and not resume:
         raise SystemExit('Server is not running. Use resume for this same session; never replay a turn.')
@@ -173,6 +177,8 @@ def _ensure_server_running(session_id: str, *, resume=False) -> int:
     for _ in range(1800):  # Three minutes; one launch only, never spawn a retry.
         time.sleep(0.1)
         if child.poll() is not None:
+            if _session_meta(session_id).get('error') == 'incompatible_checkpoint_engine_version':
+                raise SystemExit('Incompatible checkpoint engine version; cannot resume. Exit this agent run; do not create another game.')
             raise SystemExit("Server could not resume. Report failure and exit; do not create another game.")
         if port_file.exists():
             try:
@@ -198,23 +204,36 @@ def _api_call(port: int, method: str, path: str, body: dict = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=1800) as resp:
-            return json.loads(resp.read())
+            result = json.loads(resp.read())
+        request_id = (body or {}).get('request_id')
+        if request_id and (not isinstance(result, dict) or not isinstance(result.get('success'), bool)):
+            print(f'Error: Request outcome unknown; request_id={request_id}. Invalid response; inspect request-status.', file=sys.stderr)
+            raise SystemExit(1)
+        return result
     except urllib.error.HTTPError as e:
+        request_id = (body or {}).get('request_id')
+        if e.code >= 500 and request_id:
+            print(f'Error: Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.', file=sys.stderr)
+            raise SystemExit(1)
         body_bytes = e.read()
         try:
             return json.loads(body_bytes)
         except Exception:
             print(f"Error: HTTP {e.code}: {body_bytes.decode('utf-8', errors='replace')[:500]}", file=sys.stderr)
             sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Error: Failed to connect to server: {e}", file=sys.stderr)
-        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError, UnicodeError) as e:
+        request_id = (body or {}).get('request_id')
+        if request_id:
+            print(f'Error: Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.', file=sys.stderr)
+        else:
+            print(f"Error: Failed to connect to server: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def _log_history(session_id: str, entry: dict):
     if session_id == "__env__":
         return
-    history_path = _sessions_dir() / session_id / "history.jsonl"
+    history_path = _sessions_dir() / session_id / "client-history.jsonl"
     try:
         with open(history_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
@@ -322,17 +341,12 @@ def _execute_python(session_id: str, port: int, code: str, source: str = "unknow
 
     result = subprocess.run(
         [sys.executable, "-c", code],
-        capture_output=True,
+        # Inherit streams so request IDs and progress are visible immediately.
+        # Long, valid scripts must not be killed at an arbitrary 300 seconds.
         text=True,
         env=env,
         cwd=str(_base_dir()),
-        timeout=300,
     )
-
-    if result.stdout:
-        print(result.stdout, end="")
-    if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
 
     _log_history(session_id, {
         "type": "python_exec",
@@ -398,21 +412,18 @@ def cmd_status(args):
 
 def cmd_history(args):
     session_id = _resolve_session(args.session)
-    history_path = _sessions_dir() / session_id / "history.jsonl"
-    if not history_path.exists() or history_path.stat().st_size == 0:
-        print(json.dumps({"history": [], "count": 0}))
-        return
-    entries = []
-    for line in history_path.read_text().strip().split("\n"):
-        if line.strip():
-            try:
-                entries.append(json.loads(line))
-            except Exception:
-                pass
-    tail = args.tail
-    if len(entries) > tail:
-        entries = entries[-tail:]
-    print(json.dumps({"history": entries, "count": len(entries)}, indent=2, default=str))
+    if session_id == '__env__':
+        session_id = args.session or _get_latest_session()
+        if not session_id:
+            raise SystemExit('History requires a persisted session.')
+    # Dedicated read-only command; never starts or resumes the game server.
+    result = _run_server_cmd(['history', '--session', session_id, '--tail', str(args.tail)])
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.stderr:
+        print(result.stderr.strip(), file=sys.stderr)
+    if result.returncode:
+        raise SystemExit(result.returncode)
 
 
 def cmd_list_sessions(args):
@@ -466,7 +477,7 @@ def cmd_resume(args):
 def cmd_request_status(args):
     session_id = _resolve_session(args.session)
     port = _ensure_server_running(session_id)
-    print(json.dumps(_api_call(port, 'GET', '/requests/' + args.request_id)))
+    print(json.dumps(_api_call(port, 'GET', '/requests/' + urllib.parse.quote(args.request_id, safe=''))))
 
 
 def main():

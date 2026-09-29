@@ -12,7 +12,14 @@ import pickle
 import time
 from pathlib import Path
 
-VERSION = 1
+# Version 2 requires immutable customer baselines and consistent effective
+# renewal prices. Version-1 state may contain already-shifted latent baselines;
+# there is no lossless migration, so never resume it under the new semantics.
+VERSION = 2
+
+
+class IncompatibleCheckpointError(RuntimeError):
+    """A committed session belongs to an incompatible simulator generation."""
 
 
 def atomic_json(path, value):
@@ -33,6 +40,7 @@ def atomic_json(path, value):
 def initialize_integrity(conn):
     conn.execute('CREATE TABLE IF NOT EXISTS _runtime_checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, day INTEGER NOT NULL, state BLOB NOT NULL)')
     conn.execute('CREATE TABLE IF NOT EXISTS _request_journal (request_id TEXT PRIMARY KEY, digest TEXT NOT NULL, operation TEXT NOT NULL, status TEXT NOT NULL, result TEXT, created_at REAL NOT NULL, payload TEXT NOT NULL)')
+    conn.execute('CREATE TABLE IF NOT EXISTS _public_action_history (request_id TEXT PRIMARY KEY, entry TEXT NOT NULL)')
     conn.commit()
 
 
@@ -54,8 +62,10 @@ def write_checkpoint(conn, simulator, tools=None, shock_manager=None):
 
 def read_checkpoint(conn):
     row = conn.execute('SELECT version, day, state FROM _runtime_checkpoint WHERE id=1').fetchone()
-    if not row or row[0] != VERSION:
-        raise RuntimeError('unrecoverable_session: missing or incompatible complete checkpoint')
+    if not row:
+        raise RuntimeError('unrecoverable_session: missing complete checkpoint')
+    if row[0] != VERSION:
+        raise IncompatibleCheckpointError('unrecoverable_session: incompatible checkpoint engine version; cannot resume with this engine; do not replay or create a replacement game')
     pending = conn.execute("SELECT request_id FROM _request_journal WHERE status != 'completed' LIMIT 1").fetchone()
     if pending:
         raise RuntimeError('unrecoverable_session: interrupted request; do not replay or create a replacement game')
@@ -85,6 +95,8 @@ class RequestJournal:
         self.conn = conn
         self.checkpoint = checkpoint
         initialize_integrity(conn)
+        self._published_rowid = 0
+        self._history_needs_rebuild = True
 
     def lookup(self, request_id):
         row = self.conn.execute('SELECT status,result FROM _request_journal WHERE request_id=?', (request_id,)).fetchone()
@@ -95,7 +107,11 @@ class RequestJournal:
     def execute(self, request_id, operation, payload, callback):
         if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
             return {'success': False, 'error': 'request_id_required'}
-        digest = hashlib.sha256(json.dumps([operation, payload], sort_keys=True, allow_nan=False).encode()).hexdigest()
+        try:
+            payload_json = json.dumps(payload, sort_keys=True, allow_nan=False)
+            digest = hashlib.sha256(json.dumps([operation, payload], sort_keys=True, allow_nan=False).encode()).hexdigest()
+        except (TypeError, ValueError):
+            return {'success': False, 'error': 'invalid_request_payload'}
         row = self.conn.execute('SELECT digest,status,result FROM _request_journal WHERE request_id=?', (request_id,)).fetchone()
         if row:
             if row[0] != digest:
@@ -105,7 +121,9 @@ class RequestJournal:
             return {'success': False, 'error': 'unrecoverable_session', 'request_id': request_id}
         if self.conn.execute("SELECT 1 FROM _request_journal WHERE status!='completed' LIMIT 1").fetchone():
             return {'success': False, 'error': 'unrecoverable_session'}
-        self.conn.execute('INSERT INTO _request_journal VALUES (?,?,?,?,?,?,?)', (request_id, digest, operation, 'pending', None, time.time(), json.dumps(payload, sort_keys=True, allow_nan=False)))
+        before_day = self.conn.execute('SELECT day FROM _runtime_checkpoint WHERE id=1').fetchone()[0]
+        started_at = time.time()
+        self.conn.execute('INSERT INTO _request_journal VALUES (?,?,?,?,?,?,?)', (request_id, digest, operation, 'pending', None, started_at, payload_json))
         self.conn.commit()  # Durable BEFORE any action, including LLM calls.
         try:
             result = callback()
@@ -113,12 +131,73 @@ class RequestJournal:
                 result = result.to_json()
             self.checkpoint()
             self.conn.execute("UPDATE _request_journal SET status='completed', result=? WHERE request_id=?", (json.dumps(result, default=str), request_id))
-            self.conn.commit()  # Full runtime state + result acknowledged together.
+            after_day = self.conn.execute('SELECT day FROM _runtime_checkpoint WHERE id=1').fetchone()[0]
+            entry = {
+                'type': 'mutation', 'request_id': request_id, 'operation': operation,
+                'input': json.loads(payload_json), 'day_before': before_day, 'day': after_day,
+                'started_at': started_at, 'timestamp': time.time(),
+                'outcome': 'completed',
+                'success': bool(result.get('success', False)) if isinstance(result, dict) else False,
+            }
+            # Never publish tool result payloads: those can contain private
+            # diagnostics in future tools. Only submitted inputs and outcome.
+            self.conn.execute('INSERT INTO _public_action_history VALUES (?,?)',
+                              (request_id, json.dumps(entry, default=str)))
+            self.conn.commit()  # Runtime, result, and public audit commit together.
             return result
         except BaseException:
             self.conn.rollback()
             # Already committed internal simulator writes must never be replayed.
             raise
+
+    def publish_history(self, path, *, rebuild=False):
+        """Project committed public records; authority remains inside the DB.
+
+        A crash may leave this convenience JSONL stale or its last line torn.
+        Rebuild on safe startup; offline `history` reads the DB directly.
+        """
+        path = Path(path)
+        rebuild = rebuild or self._history_needs_rebuild
+        if rebuild:
+            temporary = path.with_name(path.name + '.tmp')
+            with temporary.open('w') as stream:
+                last = 0
+                for row in self.conn.execute('SELECT rowid,entry FROM _public_action_history ORDER BY rowid'):
+                    stream.write(row[1] + '\n')
+                    last = row[0]
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            self._published_rowid = last
+            self._history_needs_rebuild = False
+        else:
+            rows = self.conn.execute('SELECT rowid,entry FROM _public_action_history WHERE rowid>? ORDER BY rowid', (self._published_rowid,)).fetchall()
+            if rows:
+                self._history_needs_rebuild = True
+                with path.open('a') as stream:
+                    for row in rows:
+                        stream.write(row[1] + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self._published_rowid = rows[-1][0]
+                self._history_needs_rebuild = False
+        return self._published_rowid
+
+
+def public_history(conn, tail=50):
+    """Read only public audit inputs/outcomes, including truthful pending IDs."""
+    exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='_public_action_history'").fetchone()
+    if not exists:
+        return {'history': [], 'count': 0, 'authoritative': False,
+                'error': 'history_unavailable_for_legacy_session'}
+    limit = int(tail) if tail and int(tail) > 0 else -1
+    rows = conn.execute('SELECT entry FROM _public_action_history ORDER BY rowid DESC LIMIT ?', (limit,)).fetchall()
+    entries = [json.loads(row[0]) for row in reversed(rows)]
+    pending = [{'request_id': row[0], 'operation': row[1], 'outcome': row[2]}
+               for row in conn.execute("SELECT request_id,operation,status FROM _request_journal WHERE status!='completed' ORDER BY created_at")]
+    missing = conn.execute("SELECT COUNT(*) FROM _request_journal r LEFT JOIN _public_action_history h USING(request_id) WHERE r.status='completed' AND h.request_id IS NULL").fetchone()[0]
+    return {'history': entries, 'count': len(entries), 'authoritative': True,
+            'pending_requests': pending, 'unaudited_legacy_requests': missing}
 
 
 def wait_for_exit(pid, timeout=30):

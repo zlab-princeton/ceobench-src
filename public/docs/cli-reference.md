@@ -17,6 +17,12 @@ restore an older checkpoint, or replay earlier actions. Do not manually kill or
 restart simulator processes. `stop` requests a graceful server stop and waits
 for confirmed termination; it is an operator command, not a strategy tool.
 
+Checkpoints from engine versions before version2 are incompatible with the
+corrected customer baseline and renewal semantics. If resume reports an
+incompatible checkpoint, report that failure and exit; do not create a replacement
+game. Existing committed history remains readable; missing legacy audit data is
+reported explicitly rather than reconstructed.
+
 ## Observation and tools
 
 ```bash
@@ -33,6 +39,16 @@ read-only; hidden columns remain unavailable in filters, joins and expressions.
 Do not use raw engine/event logs or private checkpoint files as observations.
 See `novamind_api/` and `tools-reference.md` for supported SDK signatures.
 Daily-script registration and reinitialization are unsupported and rejected.
+
+Python scripts stream stdout/stderr and wait until they finish; there is no
+300-second script cutoff. Each SDK mutation prints its request ID to stderr
+before submission. If interrupted or disconnected, inspect `request-status ID`
+before deciding what happened; never blindly replay a possibly committed action.
+`history` reads the authoritative committed engine audit without starting or
+resuming the server. It includes SDK actions, request IDs, inputs and outcomes;
+pending and legacy unaudited requests are identified separately. `history.jsonl`
+is a convenience projection that may lag after a crash; `client-history.jsonl`
+contains local query and script diagnostics, not authoritative game actions.
 
 ## Advance and request status
 

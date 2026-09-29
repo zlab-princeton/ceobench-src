@@ -1,6 +1,7 @@
 """HTTP client for communicating with the NovaMind API server."""
 
 import json
+import http.client
 import uuid
 import os
 import sys
@@ -11,7 +12,41 @@ from typing import Any, Dict, Optional
 
 class NovaMindAPIError(Exception):
     """Raised when an API call fails."""
-    pass
+    def __init__(self, message, *, request_id=None, outcome=None):
+        super().__init__(message)
+        self.request_id = request_id
+        self.outcome = outcome
+
+
+def _perform_request(req, request_id):
+    # The wrapper streams stderr. Print before submission so an interrupted
+    # caller can inspect the same request instead of making a new submission.
+    print(json.dumps({'request_id': request_id}), file=sys.stderr, flush=True)
+    try:
+        with urllib.request.urlopen(req) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code >= 500:
+            raise NovaMindAPIError(
+                f'Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.',
+                request_id=request_id, outcome='unknown') from None
+        try:
+            body = json.loads(exc.read())
+            message = body.get('error', f'HTTP {exc.code}')
+        except Exception:
+            message = f'HTTP {exc.code}'
+        raise NovaMindAPIError(message, request_id=request_id, outcome='rejected') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError, UnicodeError):
+        raise NovaMindAPIError(
+            f'Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.',
+            request_id=request_id, outcome='unknown') from None
+    if not isinstance(result, dict) or not isinstance(result.get('success'), bool):
+        raise NovaMindAPIError(
+            f'Request outcome unknown; request_id={request_id}. Invalid response shape; inspect request-status.',
+            request_id=request_id, outcome='unknown')
+    if not result['success']:
+        raise NovaMindAPIError(result.get('error', 'Unknown error'), request_id=request_id, outcome='failed')
+    return result
 
 
 class _Vars:
@@ -62,17 +97,7 @@ def call(tool_name: str, args: Optional[Dict[str, Any]] = None, *, request_id: O
         method='POST',
     )
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.URLError as e:
-        raise NovaMindAPIError(f"Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.")
-    except json.JSONDecodeError as e:
-        raise NovaMindAPIError(f"Invalid JSON response: {e}")
-
-    if not result.get('success', False):
-        error_msg = result.get('error', 'Unknown error')
-        raise NovaMindAPIError(error_msg)
+    result = _perform_request(req, request_id)
 
     return result.get('data', {})
 
@@ -135,23 +160,7 @@ def next_week(predictions: Dict[str, Any] = None, rationale: str = None, *, requ
         method='POST',
     )
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read()
-        try:
-            result = json.loads(body)
-            error_msg = result.get('error', f'HTTP {e.code}')
-        except Exception:
-            error_msg = f"HTTP {e.code}: {body.decode('utf-8', errors='replace')[:500]}"
-        raise NovaMindAPIError(error_msg)
-    except urllib.error.URLError as e:
-        raise NovaMindAPIError(f"Request outcome unknown; request_id={request_id}. Inspect request-status; do not replay with a new ID.")
-
-    if not result.get('success', False):
-        error_msg = result.get('error', 'Unknown error')
-        raise NovaMindAPIError(error_msg)
+    result = _perform_request(req, request_id)
 
     return result
 

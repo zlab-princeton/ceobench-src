@@ -203,7 +203,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                 self._handle_dashboard_get()
             elif self.path.startswith('/requests/'):
                 server = self.server._api_server
-                self._send_json(server.request_status(self.path.rsplit('/', 1)[-1]))
+                from urllib.parse import unquote
+                request_id = unquote(self.path[len('/requests/'):])
+                self._send_json(server.request_status(request_id))
             elif self.path == '/game-status':
                 self._handle_game_status()
             else:
@@ -551,6 +553,19 @@ class _APIHandler(BaseHTTPRequestHandler):
                              timed_out=server._step_day_timed_out))
 
 
+def _dispatch_targeted_ops_spend(tools, args):
+    """Accept scoped requests and the original bare group-map HTTP format."""
+    if not isinstance(args, dict):
+        return ToolResult(False, "Targeted operations arguments must be a dict.")
+    scopes = {'targeted_spend', 'by_group', 'by_plan', 'by_group_plan', 'by_customer'}
+    if args and not scopes.intersection(args):
+        return tools.set_targeted_ops_spend(targeted_spend=args)
+    unknown = set(args) - scopes
+    if unknown:
+        return ToolResult(False, "Unknown targeted operations arguments: " + ", ".join(sorted(unknown)))
+    return tools.set_targeted_ops_spend(**args)
+
+
 # Map tool names to AgentTools methods + argument extraction
 _TOOL_DISPATCH = {
     'set_prices': lambda tools, args: tools.set_prices({k: v for k, v in args.items() if v is not None}),
@@ -570,7 +585,7 @@ _TOOL_DISPATCH = {
     'research_group': lambda tools, args: tools.research_group(args.get('group_id', ''), args.get('target_level')),
     'get_market_overview': lambda tools, args: tools.get_market_overview(),
     'get_group_insights': lambda tools, args: tools.get_group_insights(args.get('group_id', '')),
-    'set_targeted_ops_spend': lambda tools, args: tools.set_targeted_ops_spend(args.get('targeted_spend', args)),
+    'set_targeted_ops_spend': _dispatch_targeted_ops_spend,
     'set_targeted_dev_spend': lambda tools, args: tools.set_targeted_dev_spend(args.get('targeted_spend', args)),
     'set_ads_strength': lambda tools, args: tools.set_ads_strength(
         global_strength=args.get('global_strength'),

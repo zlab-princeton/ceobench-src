@@ -99,6 +99,12 @@ analysis files, whatever helps you decide. Common things you can do:
 ./novamind-operation history
 ```
 
+Python scripts stream output and wait until completion, including scripts longer
+than five minutes. SDK actions print a request ID before submission. If a script
+is interrupted, inspect `request-status ID`; never replay an uncertain action.
+`history` reads committed engine actions, including SDK calls, without starting
+or resuming the simulator. It distinguishes pending requests from completed ones.
+
 All simulator tools are accessed via the Python API (`import novamind_api as nm`)
 — see `docs/tools-reference.md`.
 

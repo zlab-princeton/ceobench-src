@@ -433,6 +433,10 @@ class Simulator:
 
         for plan in ['A', 'B', 'C']:
             price = config[f'price_{plan}']
+            # Evaluate the same grandfathered list price billing will charge.
+            # Global increases apply to new plans, not an existing subscription.
+            if plan == sub_row['plan']:
+                price = min(price, sub_row['listed_price'])
             # The current plan's first-period promotion is snapshotted at
             # signup so channel-targeted lead discounts survive until billing.
             # All later renewals and alternative plans use the current ongoing
@@ -988,28 +992,20 @@ class Simulator:
         )
 
         # c_max: hard budget constraint (maximum price customer will pay)
-        # Sample from static group distribution, then apply accumulated group drift
+        # Sample baseline from the static group distribution.
         c_max = max(15.0,
             grng.normal(group.c_max_mean, group.c_max_std * 1.2)
         )
 
-        # q_min: quality floor — sample from static, then apply global + group drift
+        # q_min: baseline quality floor; drift is applied at read time.
         q_min = max(1e-4, grng.normal(group.q_min_mean, group.q_min_std))
 
         # q_range: independently sampled (unaffected by drift — drift shifts q_min and q_max equally)
         q_range = max(1e-4, grng.normal(group.q_range_mean, group.q_range_std))
 
-        # Apply accumulated drift offsets to new customer parameters.
-        # _drift_cache is set at start of each step_day via _cache_drift_state().
-        # This ensures new customers reflect current market conditions (global + group drift).
-        drift = getattr(self, '_drift_cache', None)
-        if drift:
-            group_drift = drift['groups'].get(group_id, {})
-            q_bias_offset = drift['global_q_bias'] + group_drift.get('drift_q_bias_total', 0.0)
-            c_max_offset = group_drift.get('drift_c_max_total', 0.0)
-            q_min += q_bias_offset
-            c_max = max(15.0, c_max + c_max_offset)
-
+        # Persist sampled baseline parameters. Accumulated market drift is applied
+        # at evaluation time for every cohort, including initial acquisition.
+        # Baking it into new rows would apply it twice after signup.
         q_max = q_min + q_range
 
         # usage_demand: how much they want to use the service
@@ -1876,7 +1872,7 @@ class Simulator:
                     direction = 'downgrade'
 
                 # Update subscription — recompute promotion + effective_price for new plan
-                # Also snapshot effective_c_max at billing time (drifted c_max for satisfaction)
+                # Snapshot the baseline budget; satisfaction applies current market drift.
                 group_id = sub['group_id']
                 new_promo = self._get_effective_promotion(customer_id, group_id, best_plan)
                 new_eff_price = max(0.0, new_price - new_promo)
@@ -1885,7 +1881,7 @@ class Simulator:
                            promotion = ?, effective_price = ?,
                            effective_c_max = ?
                     WHERE subscription_id = ?
-                """, (best_plan, new_price, new_promo, new_eff_price, c_max, sub['subscription_id']))
+                """, (best_plan, new_price, new_promo, new_eff_price, sub['current_c_max'] or sub['c_max'], sub['subscription_id']))
 
                 # Log plan change
                 if self.event_logger:
@@ -2123,6 +2119,7 @@ class Simulator:
                 c_max = params.get('c_max', 100.0)
                 q_max = params.get('q_max', 0.75)
                 q_min = params.get('q_min', 0.25)
+                q_min, q_max, c_max = self._apply_drift_offsets(group_id, q_min, q_max, c_max)
 
                 lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
                 effective_price = max(0.0, price - lead_promo)
@@ -2439,6 +2436,7 @@ class Simulator:
         q_max = params.get('q_max', 0.75)
         q_min = params.get('q_min', 0.25)
         group_id = params.get('group_id', 'S1')
+        q_min, q_max, c_max = self._apply_drift_offsets(group_id, q_min, q_max, c_max)
 
         best_plan = 'A'
         best_satisfaction = float('-inf')
@@ -7106,13 +7104,9 @@ Guidelines:
                 if billing_price < sub['listed_price']:
                     price_updates.append((billing_price, sub['subscription_id']))
 
-            # Snapshot drifted c_max at billing time for satisfaction calculations
+            # Snapshot baseline budget. Satisfaction applies drift at read time;
+            # storing a drifted budget here would add the same offset twice.
             billing_c_max = sub['current_c_max'] or sub['c_max']
-            # Apply group + global drift offset to c_max
-            drift = getattr(self, '_drift_cache', None)
-            if drift:
-                gd = drift['groups'].get(group_id, {})
-                billing_c_max = max(15.0, billing_c_max + gd.get('drift_c_max_total', 0.0))
 
             # Compute promotion for this billing period
             existing_promo = self._get_effective_promotion(customer_id, group_id, current_plan)

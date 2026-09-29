@@ -185,3 +185,34 @@ def test_social_reply_retains_public_enrichment(monkeypatch, db):
     result = AgentTools.get_social_posts(SimpleNamespace(conn=db))
     assert result.data['posts'] == [{'post_id': 2, 'day': 1, 'content': 'public reply',
         'reply_to_agent_post_id': 1, 'replying_to_your_post': 'hello'}]
+
+
+@pytest.mark.parametrize('driver', ['sqlite', 'sqlcipher'])
+def test_every_documented_column_accepts_sqlite_identifier_casing(tmp_path, monkeypatch, driver):
+    from saas_bench.database import init_database
+    from saas_bench.db_protection import protect_db, open_encrypted
+    plain = tmp_path / 'all-tables.db'
+    conn = init_database(plain)
+    if driver == 'sqlcipher':
+        conn.close()
+        monkeypatch.setenv('NMDB_KEY', 'full-public-schema-test-key')
+        encrypted = tmp_path / 'all-tables.nmdb'
+        protect_db(plain, encrypted)
+        conn = open_encrypted(encrypted)
+    try:
+        with public_query_boundary(conn):
+            for table, doc in PUBLIC_TABLE_DOCS.items():
+                expected = list(doc['columns'])
+                assert [d[0] for d in conn.execute(f'SELECT * FROM "{table}" LIMIT 0').description] == expected
+                for spelling in (str.lower, str.upper, str.swapcase):
+                    # Main-table access exercises the authorizer directly; the
+                    # unqualified view path also checks generated projection.
+                    columns = ', '.join('"' + spelling(c) + '"' for c in expected)
+                    for prefix in ('', 'main.'):
+                        sql = f'SELECT {columns} FROM {prefix}"{spelling(table)}" LIMIT 0'
+                        assert len(conn.execute(sql).description) == len(expected), sql
+            # Original production regression: names in this schema contain A/B/C.
+            cursor = conn.execute('SELECT price_A, tier_B, quota_C FROM config_history LIMIT 0')
+            assert len(cursor.description) == 3
+    finally:
+        conn.close()

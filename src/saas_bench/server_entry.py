@@ -45,7 +45,7 @@ from saas_bench.db_protection import (
 from saas_bench.docs_generator import initialize_workspace
 from saas_bench.session_integrity import (
     atomic_json, initialize_integrity, write_checkpoint, read_checkpoint,
-    restore_runtime, RequestJournal,
+    restore_runtime, RequestJournal, public_history, IncompatibleCheckpointError,
 )
 
 
@@ -319,9 +319,20 @@ def cmd_start_server(args, base: Path):
         api_server = NovaMindAPIServer(tools=tools, simulator=simulator, conn=conn, shock_manager=shock_manager)
         api_server.journal = RequestJournal(conn, lambda: write_checkpoint(conn, simulator, tools, shock_manager))
         api_server.refresh_committed_status()
+        try:
+            api_server.journal.publish_history(_session_history_path(base, session_id), rebuild=True)
+        except OSError:
+            meta['history_projection_error'] = 'projection_stale_use_history_command'
 
         def publish_status():
             snapshot = api_server._committed_status
+            try:
+                meta['history_projection_rowid'] = api_server.journal.publish_history(_session_history_path(base, session_id))
+                meta.pop('history_projection_error', None)
+            except OSError:
+                # Audit remains durable in the encrypted DB. Offline `history`
+                # can read it even if this convenience projection failed.
+                meta['history_projection_error'] = 'projection_stale_use_history_command'
             meta.update(current_day=snapshot['day'], ledger_day=snapshot['day'],
                         cash=snapshot['cash'], snapshot_at=snapshot['snapshot_at'],
                         status='running', integrity_version=1)
@@ -358,9 +369,10 @@ def cmd_start_server(args, base: Path):
             meta.pop('pid', None)
             atomic_json(meta_path, meta)
             conn.close()
-    except Exception:
+    except Exception as exc:
         meta['status'] = 'unrecoverable'
-        meta['error'] = 'unsafe_resume_or_checkpoint_failure'
+        meta['error'] = ('incompatible_checkpoint_engine_version' if isinstance(exc, IncompatibleCheckpointError)
+                         else 'unsafe_resume_or_checkpoint_failure')
         atomic_json(meta_path, meta)
         original_stderr.write('Unrecoverable session. Stop this agent run; do not replay or create a replacement game.\n')
         raise SystemExit(1)
@@ -448,25 +460,18 @@ def cmd_list_sessions(args, base: Path):
 def cmd_history(args, base: Path):
     """Show session tool call history."""
     session_id = _resolve_session(base, args.session)
-    history_path = _session_history_path(base, session_id)
-
-    if not history_path.exists() or history_path.stat().st_size == 0:
-        print(json.dumps({"history": [], "count": 0}))
+    path = _session_nmdb_path(base, session_id)
+    if not path.exists():
+        print(json.dumps({'success': False, 'error': 'session_database_missing'}))
         return
-
-    entries = []
-    for line in history_path.read_text().strip().split("\n"):
-        if line.strip():
-            try:
-                entries.append(json.loads(line))
-            except Exception:
-                pass
-
-    tail = args.tail or 50
-    if len(entries) > tail:
-        entries = entries[-tail:]
-
-    print(json.dumps({"history": entries, "count": len(entries)}, indent=2, default=str))
+    conn = load_session_db(path, in_memory=False)
+    try:
+        conn.execute('PRAGMA query_only=ON')
+        conn.execute('BEGIN')
+        result = public_history(conn, args.tail)
+    finally:
+        conn.close()
+    print(json.dumps(result, indent=2, default=str))
 
 
 def main():
