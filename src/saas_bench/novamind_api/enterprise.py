@@ -9,7 +9,7 @@ def send_enterprise_deal(deals: List) -> Dict:
 
     Compact tuple format: deals=[[customer_id, [["plan", price_per_seat, contract_months], ...]]]
 
-    If customer has an open thread, this replies; otherwise initiates renegotiation.
+    Reply to the customer's latest turn, or initiate a seller renegotiation. An offer awaiting a reply cannot be replaced.
 
     Args:
         deals: List of [customer_id, [offerings]] pairs.
@@ -23,7 +23,7 @@ def send_enterprise_deal(deals: List) -> Dict:
 def reject_enterprise_deal(deals: List) -> Dict:
     """Reject enterprise negotiation threads.
 
-    WARNING: Rejecting renegotiation/renewal/churn_prevention threads causes churn.
+    Rejecting a renewal or churn-prevention request ends the subscription. Declining a plan change or seller renegotiation leaves existing terms unchanged.
 
     Args:
         deals: List of customer deal rejection specs.

@@ -468,7 +468,7 @@ TOOL_DOCS = {
     "set_usage_quotas": {
         "name": "set_usage_quotas",
         "category": "Business Configuration",
-        "description": "Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota degrades experience.",
+        "description": "Set daily usage quotas (rate limits) per seat for each plan. Exceeding quota degrades experience.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -479,19 +479,19 @@ TOOL_DOCS = {
             "required": ["A", "B", "C"]
         },
         "parameters": {
-            "A": {"type": "int", "description": "Daily usage quota for plan A (units/day per customer)"},
-            "B": {"type": "int", "description": "Daily usage quota for plan B (units/day per customer)"},
-            "C": {"type": "int", "description": "Daily usage quota for plan C (units/day per customer)"}
+            "A": {"type": "int", "description": "Daily usage quota for plan A (units/day per seat)"},
+            "B": {"type": "int", "description": "Daily usage quota for plan B (units/day per seat)"},
+            "C": {"type": "int", "description": "Daily usage quota for plan C (units/day per seat)"}
         },
         "returns": {
             "success": "Usage quotas updated: A=100 units/day, B=500 units/day, C=2,000 units/day",
             "failure": "Missing quota for plan X / Quota for plan X cannot be negative"
         },
         "output_schema": {
-            "quotas": "Dict[str, int] — {'A': int, 'B': int, 'C': int} units/day per customer",
+            "quotas": "Dict[str, int] — {'A': int, 'B': int, 'C': int} units/day per seat",
             "_access": "result['quotas']['A'] → plan A daily quota"
         },
-        "impact": "Quotas limit per-customer usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.",
+        "impact": "Quotas limit per-seat usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.",
         "example_call": {
             "tool": "set_usage_quotas",
             "arguments": {"A": 150, "B": 750, "C": 3000},
@@ -1014,7 +1014,7 @@ TOOL_DOCS = {
     "reject_enterprise_deal": {
         "name": "reject_enterprise_deal",
         "category": "Customer Communication",
-        "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn.",
+        "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost; rejection ends retention or renewal contracts but preserves terms on plan changes and seller renegotiations.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1040,14 +1040,14 @@ TOOL_DOCS = {
             }
         },
         "returns": {
-            "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Customer may cancel.",
+            "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Subscription cancelled.",
             "failure": "Customer #312: no active thread / Customer #999: not found"
         },
         "output_schema": {
             "results": "List[Dict] — one dict per deal with keys: customer_id (int), success (bool), thread_type (str), error (str, if failed)",
             "_access": "for r in result['results']: print(r['customer_id'], r['success'])"
         },
-        "impact": "For new_lead threads: lead is permanently lost. For renegotiation/renewal threads: customer CHURNS (cancels subscription). For churn_prevention/plan_change threads: customer churns with reputation damage.",
+        "impact": "Rejecting a lead loses it. Rejecting a retention or renewal request cancels service. Rejecting a plan change or seller renegotiation preserves the existing contract. An offer awaiting a customer reply cannot be withdrawn.",
         "example_call": {
             "tool": "reject_enterprise_deal",
             "arguments": {"deals": [{"customer_id": 312}]},
@@ -1055,7 +1055,7 @@ TOOL_DOCS = {
         "sample_io": {
             "success": [
                 {"label": "Reject single customer", "input": {"deals": [{"customer_id": 312}]}, "output": "Processed 1/1 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost."},
-                {"label": "Reject existing customer", "input": {"deals": [{"customer_id": 88}]}, "output": "Processed 1/1 rejections:\n  Customer #88: Rejected (churn_prevention). Customer may cancel."},
+                {"label": "Reject existing customer", "input": {"deals": [{"customer_id": 88}]}, "output": "Processed 1/1 rejections:\n  Customer #88: Rejected (churn_prevention). Subscription cancelled."},
                 {"label": "Batch rejection", "input": {"deals": [{"customer_id": 312}, {"customer_id": 88}]}, "output": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (plan_change)."}
             ],
             "failure": [
