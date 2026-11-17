@@ -413,6 +413,11 @@ def compute_offering_satisfaction(
     Returns:
         Satisfaction score. Positive = acceptable, negative = unacceptable.
     """
+    # Hard budget cap: never accept an offer above budget, whatever the quality
+    # (beyond c_max the required quality saturates at q_max).
+    if price > c_max:
+        return float('-inf')
+
     q_required = _compute_required_quality(price, steepness_left, steepness_right, c_max, q_max, q_min)
 
     # Contract lock-in penalty: longer contracts reduce satisfaction (customer dislikes lock-in)

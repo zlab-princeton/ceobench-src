@@ -542,3 +542,28 @@ def test_same_plan_renewal_billing_preserves_stored_price_when_evaluated_is_high
     ).fetchone()
     assert sub["listed_price"] == pytest.approx(10.0)
     assert sub["effective_price"] == pytest.approx(10.0)
+
+
+def test_enterprise_refuses_offers_above_budget_at_any_quality():
+    from saas_bench.enterprise import NegotiationState, evaluate_offerings
+
+    state = NegotiationState(
+        thread_id=1, customer_id=1, thread_type='new_lead', state='open', negotiation_turn=1,
+        current_offer_price=None, next_reply_day=None, steepness_left=0.8, steepness_right=1.6,
+        c_max=20.0, q_max=0.8, q_min=0.2, negotiation_rate=0.1, initial_offer_factor=0.75,
+        reply_delay_mean=1.0, reply_delay_std=0.0, max_negotiation_turns=5, seat_count=10,
+        relationship=0.5, current_plan=None, current_price=None,
+    )
+    config = BenchmarkConfig()
+    for price in (100.0, 1e250):
+        evaluation = evaluate_offerings(
+            state, [{'plan': 'C', 'price': price, 'contract_months': 1}], {'C': 2.0}, config
+        )
+        assert evaluation.decision != 'accept'
+        if evaluation.decision == 'counter':
+            assert evaluation.counter_offer_price <= state.c_max
+
+    within_budget = evaluate_offerings(
+        state, [{'plan': 'C', 'price': 15.0, 'contract_months': 1}], {'C': 2.0}, config
+    )
+    assert within_budget.decision == 'accept'
