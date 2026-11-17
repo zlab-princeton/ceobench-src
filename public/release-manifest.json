@@ -1,7 +1,7 @@
 {
-  "source_revision": "538ad2b75947423f06908de2f7987e573585e0e8",
+  "source_revision": "0d666bfadd379c333a7fda25366b3d0285d0b23c",
   "python": "3.13.5",
-  "source_tree_sha256": "6e136c9f715ae610b6ed032b2ce267064e9e142f7bb27b52713a184c675d7621",
+  "source_tree_sha256": "580815bc97034db13442358277bc06a53bd663e9c89f2e9ac51514be463bab17",
   "files_sha256": {
     ".gitignore": "da21fe60487d93d5c0c27da5d6f7dd5ef896f98e509069b866cd579f0b012a93",
     "README.md": "633954e8eb500f34729e675938de4d4e4d53e2d7f7428c5f79ba2006a9efa865",
@@ -45,7 +45,7 @@
     "docs/tables/subscriptions.json": "60bb4e24c77cc29b0564717001b3d1b74116f5ed575162be0ccf9cf035676d00",
     "docs/tables-reference.md": "9925e956d7992dc7b8cd1dd8d70309b77dc02da6c459d9f3b84f4b4b52192619",
     "docs/tools-reference.md": "ecac5001f25259de3a2b6a6380972ecd5c06eafe85f30b7ba30a8a6b04380a44",
-    "novamind-operation": "80c4b81bdba69f9499fc95c051affcc402d86266cd627587b7203cb1a5a894d7",
+    "novamind-operation": "002b768c70c5b76c1033ef34742a8abe54fdf70938f01aac9b5fcace36c56ee3",
     "requirements.txt": "13ae40bfd8c978a3648b2ec68c8fc3bd9089e0ad33eff176440c2556a2f20191"
   }
 }
