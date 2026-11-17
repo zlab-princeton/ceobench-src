@@ -203,7 +203,8 @@ def cmd_new_session(args, base: Path):
     sdir.mkdir(parents=True, exist_ok=True)
 
     total_days = args.days
-    seed = args.seed
+    import secrets
+    seed = secrets.randbits(32) if args.seed is None else args.seed
 
     # Initialize RNG and config
     rng = Generator(PCG64(seed))
@@ -335,7 +336,7 @@ def cmd_start_server(args, base: Path):
                 meta['history_projection_error'] = 'projection_stale_use_history_command'
             meta.update(current_day=snapshot['day'], ledger_day=snapshot['day'],
                         cash=snapshot['cash'], snapshot_at=snapshot['snapshot_at'],
-                        status='bankrupt' if (snapshot['cash'] is not None and snapshot['cash'] < 0) else 'running',
+                        status='bankrupt' if (snapshot['cash'] is not None and snapshot['cash'] < 0) else ('completed' if snapshot['day'] >= config.total_days else 'running'),
                         integrity_version=1)
             atomic_json(meta_path, meta)
 
@@ -350,7 +351,7 @@ def cmd_start_server(args, base: Path):
         _port_file(base, session_id).write_text(str(api_server.port))
         meta.update(port=api_server.port, pid=os.getpid())
         publish_status()
-        original_stdout.write(json.dumps({'session_id': session_id, 'port': api_server.port, 'pid': os.getpid(), 'status': 'running'}) + '\n')
+        original_stdout.write(json.dumps({'session_id': session_id, 'port': api_server.port, 'pid': os.getpid(), 'status': meta['status']}) + '\n')
         original_stdout.flush()
         shutdown_requested = False
 
@@ -365,7 +366,10 @@ def cmd_start_server(args, base: Path):
         api_server.stop()
         with api_server._lock:
             pending = conn.execute("SELECT 1 FROM _request_journal WHERE status!='completed' LIMIT 1").fetchone()
-            meta['status'] = 'unrecoverable' if pending else 'stopped'
+            if pending:
+                meta['status'] = 'unrecoverable'
+            elif meta['status'] not in ('completed', 'bankrupt'):
+                meta['status'] = 'stopped'
             meta.pop('port', None)
             meta.pop('pid', None)
             atomic_json(meta_path, meta)
@@ -488,7 +492,7 @@ def main():
     # new-session
     p_new = subparsers.add_parser("new-session", help="Create a new simulation session")
     p_new.add_argument("--days", type=int, default=365, help="Total simulation days (default: 365)")
-    p_new.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    p_new.add_argument("--seed", type=int, help="Optional reproducible world seed")
     p_new.add_argument("--cash", type=float, default=1_000_000.0, help="Initial cash (default: 1000000)")
     p_new.add_argument("--scenario", type=str, default="default", help="Scenario pack (default: default)")
 

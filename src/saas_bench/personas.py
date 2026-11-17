@@ -1803,25 +1803,6 @@ def generate_customer_persona(group_id: str, rng: Generator,
         persona['persona_tech_savvy'] = rng.choice(PERSONA_TECH_SAVVY)
         persona['persona_communication'] = rng.choice(PERSONA_COMMUNICATION_STYLES.get(group_id, ['professional']))
 
-        # Derive usage pattern from usage_demand
-        if usage_demand < 30:
-            usage_pattern = 'light user'
-        elif usage_demand < 70:
-            usage_pattern = 'regular user'
-        elif usage_demand < 120:
-            usage_pattern = 'heavy user'
-        else:
-            usage_pattern = 'power user'
-
-        # Derive price sensitivity from c_max relative to group
-        group_c_max_mean = group.c_max_mean if group else 100.0
-        if c_max < group_c_max_mean * 0.7:
-            price_sensitivity = 'budget-conscious'
-        elif c_max < group_c_max_mean * 1.0:
-            price_sensitivity = 'value-oriented'
-        else:
-            price_sensitivity = 'willing to invest'
-
         # Derive quality expectation description from group's quality floor
         q_min_mean = group.q_min_mean if group else 0.25
         if q_min_mean < 0.20:
@@ -1837,7 +1818,6 @@ def generate_customer_persona(group_id: str, rng: Generator,
         persona['persona_description'] = (
             f"{persona['persona_experience'].replace('-', ' ').title()} "
             f"{persona['persona_industry']} {persona['persona_role'].replace('-', ' ')}. "
-            f"{usage_pattern.title()}, {price_sensitivity}. "
             f"{quality_desc.capitalize()}. "
             f"{persona['persona_work_style'].replace('-', ' ').capitalize()} work style, "
             f"{persona['persona_communication'].replace('-', ' ')} communicator."
@@ -1859,16 +1839,6 @@ def generate_customer_persona(group_id: str, rng: Generator,
         persona['persona_work_style'] = persona['company_culture']  # Align with company
 
         # Size description based on seat count
-        if seat_count:
-            if seat_count < 100:
-                size_desc = f"({seat_count} employees)"
-            elif seat_count < 500:
-                size_desc = f"({seat_count} employees)"
-            else:
-                size_desc = f"({seat_count}+ employees)"
-        else:
-            size_desc = ""
-
         # Derive quality expectation description from group's quality floor
         q_min_mean = group.q_min_mean if group else 0.30
         if q_min_mean < 0.25:
@@ -1883,7 +1853,7 @@ def generate_customer_persona(group_id: str, rng: Generator,
         # Generate company profile description
         persona['persona_description'] = (
             f"{persona['company_size_descriptor'].replace('-', ' ').title()} "
-            f"{persona['persona_industry'].replace('-', ' ')} company {size_desc}. "
+            f"{persona['persona_industry'].replace('-', ' ')} company. "
             f"{persona['company_culture'].replace('-', ' ').title()} culture, "
             f"{persona['company_decision_style'].replace('-', ' ')} decision-making. "
             f"Primary focus: {persona['company_primary_concern'].replace('-', ' ')}. "

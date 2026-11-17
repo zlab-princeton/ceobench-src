@@ -249,7 +249,7 @@ def cmd_new_session(args):
     result = _run_server_cmd([
         "new-session",
         "--days", str(args.days),
-        "--seed", str(args.seed),
+        *(["--seed", str(args.seed)] if args.seed is not None else []),
         "--cash", str(args.cash),
     ])
     if result.returncode != 0:
@@ -508,7 +508,7 @@ Examples:
 
     p = subparsers.add_parser("new-session", help="Create a new simulation session")
     p.add_argument("--days", type=int, default=365, help="Total simulation days (default: 365)")
-    p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    p.add_argument("--seed", type=int, help="Optional reproducible world seed")
     p.add_argument("--cash", type=float, default=1_000_000.0, help="Initial cash (default: 1000000)")
 
     p = subparsers.add_parser(

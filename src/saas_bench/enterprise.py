@@ -239,7 +239,7 @@ def get_negotiation_state(conn: sqlite3.Connection, thread_id: int) -> Optional[
         reply_delay_std=row['reply_delay_std'] or 1.0,
         max_negotiation_turns=row['max_negotiation_turns'] or 5,
         seat_count=int(row['seat_count'] or 1),
-        relationship=row['relationship'] or 0.5,
+        relationship=row['relationship'] if row['relationship'] is not None else 0.5,
         contract_lockin_penalty=row['contract_lockin_penalty'] if row['contract_lockin_penalty'] is not None else 0.100,
         current_plan=row['current_plan'],
         current_price=row['current_price'],
@@ -342,7 +342,7 @@ def get_negotiation_states_batch(conn: sqlite3.Connection, thread_ids: List[int]
             reply_delay_std=row['reply_delay_std'] or 1.0,
             max_negotiation_turns=row['max_negotiation_turns'] or 5,
             seat_count=int(row['seat_count'] or 1),
-            relationship=row['relationship'] or 0.5,
+            relationship=row['relationship'] if row['relationship'] is not None else 0.5,
             contract_lockin_penalty=row['contract_lockin_penalty'] if row['contract_lockin_penalty'] is not None else 0.100,
             current_plan=row['current_plan'],
             current_price=row['current_price'],
@@ -496,7 +496,7 @@ def compute_customer_counter_offer(
     for _ in range(state.negotiation_turn):
         offer = offer + alpha * (max_price - offer)
 
-    return round(offer, 2)
+    return max(0.0, math.floor(offer))
 
 
 @dataclass
@@ -573,7 +573,13 @@ def evaluate_offerings(
             is_ghosting=True,
         )
 
-    if best_sat > 0:
+    minimum_sat = 0.0
+    if state.thread_type in ('plan_change', 'renegotiation') and state.current_price is not None:
+        minimum_sat = max(0.0, compute_offering_satisfaction(
+            state.current_price, state.current_plan, state.current_contract_months or 1,
+            qualities.get(state.current_plan, 0.0), state.steepness_left, state.steepness_right,
+            state.c_max, state.contract_lockin_penalty, state.q_max, state.q_min))
+    if best_sat > minimum_sat:
         # Accept the best offering
         return OfferingEvaluation(
             decision='accept',
@@ -961,7 +967,9 @@ def get_qualities_for_all_plans(
 def get_qualities_for_all_plans_batch(
     conn: sqlite3.Connection,
     customer_ids: List[int],
-    config: BenchmarkConfig
+    config: BenchmarkConfig,
+    service_penalty: float = 0.0,
+    day: Optional[int] = None,
 ) -> Dict[int, Dict[str, float]]:
     """Batch-fetch perceived quality for all plans for multiple customers.
 
@@ -1006,6 +1014,8 @@ def get_qualities_for_all_plans_batch(
     # Get current day for stickiness calculation
     day_row = conn.execute("SELECT value FROM global_state WHERE key = 'current_day'").fetchone()
     current_day = int(float(day_row['value'])) if day_row else 0
+    if day is not None:
+        current_day = day
     weekly_usage_mult = WEEKLY_MULTIPLIERS[current_day % 7]
 
     # Batch-fetch customer data (relationship, open_issue_days, subscription start_day, etc.)
@@ -1039,7 +1049,7 @@ def get_qualities_for_all_plans_batch(
                 if cust_group_id in q_group_bonus:
                     dq += q_group_bonus[cust_group_id] * tier_multipliers.get(plan, 1.0)
                 # Relationship bonus
-                rel = cust['relationship'] or 0.5
+                rel = cust['relationship'] if cust['relationship'] is not None else 0.5
                 rel_bonus = rel_bonus_max * (rel - 0.5) * 2
 
                 # Stickiness bonus (tenure loyalty)
@@ -1051,9 +1061,9 @@ def get_qualities_for_all_plans_batch(
                 issue_penalty = 0.03 * (cust['open_issue_days'] or 0)
 
                 # Quota quality factor (use actual sampled daily_usage_rate, consistent with satisfaction)
-                daily_usage_rate = cust['daily_usage_rate'] if cust['daily_usage_rate'] else 0.0
+                daily_usage_rate = cust['daily_usage_rate'] if cust['daily_usage_rate'] is not None else cust['usage_demand'] * (cust['seat_count'] or 1)
                 total_demand = daily_usage_rate * weekly_usage_mult
-                plan_quota = plan_quotas[plan]
+                plan_quota = plan_quotas[plan] * (cust['seat_count'] or 1)
                 quota_factor = compute_quota_quality_factor(plan_quota, total_demand)
 
                 # Ads penalty
@@ -1061,12 +1071,12 @@ def get_qualities_for_all_plans_batch(
                 ads_penalty = 0.0
                 if ads_sensitivity > 0:
                     group_id = cust['group_id'] or 'E1'
-                    strength = min(max(ads_global + ads_by_group.get(group_id, 0.0), 0.0), 1.0)
+                    strength = min(max(ads_global + ads_by_group.get(group_id, 0.0) + config.ads_strength_by_customer.get(cid, 0.0), 0.0), 1.0)
                     if strength > 0:
                         effective_ads = math.log(1.0 + 9.0 * strength) / math.log(10.0)
                         ads_penalty = ads_sensitivity * effective_ads
 
-                quality_before_incident_penalties = dq + rel_bonus + stickiness_bonus
+                quality_before_incident_penalties = dq - service_penalty + rel_bonus + stickiness_bonus
                 q_perceived = (
                     quality_before_incident_penalties * quota_factor
                     - issue_penalty - ads_penalty

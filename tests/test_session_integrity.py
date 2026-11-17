@@ -245,6 +245,7 @@ def test_enterprise_scheduled_reply_uses_structured_model_not_llm(tmp_path, monk
     sim.config.base_product_quality=2.0 if eligible else .01
     # Initial tier multiplier and sticky customer noise also affect eligibility.
     params=sim._generate_customer_from_group('E2')
+    tools.set_usage_quotas({'A': 1000, 'B': 1000, 'C': 1000})
     cid=sim._create_customer(params)
     sim._create_enterprise_lead(cid, params)
     tid=conn.execute('SELECT thread_id FROM enterprise_turns WHERE customer_id=?',(cid,)).fetchone()[0]

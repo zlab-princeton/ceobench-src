@@ -184,6 +184,8 @@ def test_enterprise_plan_change_uses_weekly_quota_multiplier(
     monkeypatch.setattr(sim, "_create_plan_change_thread", lambda *args: None)
 
     enterprise = {
+        "customer_id": 1,
+        "seat_count": 1,
         "plan": "A",
         "listed_price": 10.0,
         "relationship": 0.5,
@@ -501,7 +503,7 @@ def test_same_plan_renewal_billing_uses_decreased_evaluated_price(
         """,
         (customer_id,),
     ).fetchone()
-    assert sub["listed_price"] == pytest.approx(10.0)
+    assert sub["listed_price"] == pytest.approx(100.0)
     assert sub["promotion"] == pytest.approx(2.0)
     assert sub["effective_price"] == pytest.approx(8.0)
 

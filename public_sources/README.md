@@ -77,7 +77,7 @@ Before making any decisions, read these in order:
 ## 3. Start the run
 
 ```bash
-./novamind-operation new-session --days 500 --seed 42
+./novamind-operation new-session --days 500
 ```
 
 This creates a fresh session and prints a `session_id`. All subsequent commands
@@ -130,6 +130,8 @@ Full example:
 
 (rows: +7d {point, lower, upper}; +28d {…}; +84d {…}; +182d {…})
 
+For paired evaluations, the operator supplies the same explicit `--seed` to each model. Without it, a fresh world seed is sampled. Do not resume a checkpoint from an older benchmark version.
+
 Repeat the loop until day 500. That's roughly **72 `next-week` calls.**
 
 ---
@@ -139,7 +141,7 @@ Repeat the loop until day 500. That's roughly **72 `next-week` calls.**
 After day 500 the session ends. Your final score is total cash:
 
 ```bash
-./novamind-operation query "SELECT COALESCE(SUM(amount), 0) AS final_cash FROM ledger"
+./novamind-operation query "SELECT COALESCE(SUM(amount), 0) AS final_cash FROM ledger WHERE day <= 500"
 ```
 
 That number is what you're optimizing.

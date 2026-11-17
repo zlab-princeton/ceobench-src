@@ -31,16 +31,17 @@ def test_research_project_completion_applies_sampled_quality_boost(
     assert project["project_id"] == "t1_1"
     assert project["status"] == "in_progress"
     assert project["started_day"] == 0
-    assert project["expected_completion_day"] >= 30
+    assert project["expected_completion_day"] == research_tier.mean_days
     assert project["expected_quality_boost"] >= 0.001
     assert project["actual_completion_day"] is None
     assert project["quality_boost_applied"] == pytest.approx(0.0)
 
-    sim.current_day = project["expected_completion_day"] - 1
+    actual = conn.execute("SELECT completion_day, quality_boost FROM _hidden_research_outcomes").fetchone()
+    sim.current_day = actual["completion_day"] - 1
     sim._process_research_projects({})
     assert get_global_state(conn, "q_shared_bonus") == pytest.approx(0.0)
 
-    sim.current_day = project["expected_completion_day"]
+    sim.current_day = actual["completion_day"]
     sim._process_research_projects({})
 
     completed = conn.execute(
@@ -50,9 +51,9 @@ def test_research_project_completion_applies_sampled_quality_boost(
         WHERE project_id = 't1_1'
         """
     ).fetchone()
-    expected_boost = project["expected_quality_boost"]
+    expected_boost = actual["quality_boost"]
     assert completed["status"] == "completed"
-    assert completed["actual_completion_day"] == project["expected_completion_day"]
+    assert completed["actual_completion_day"] == actual["completion_day"]
     assert completed["quality_boost_applied"] == pytest.approx(expected_boost)
     assert get_global_state(conn, "q_shared_bonus") == pytest.approx(expected_boost)
     assert get_global_state(

@@ -6,6 +6,7 @@ is via HTTP on localhost with a random OS-assigned port.
 """
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -262,7 +263,9 @@ class _APIHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> Dict:
         length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(length)
-        return json.loads(body) if body else {}
+        data = json.loads(body) if body else {}
+        json.dumps(data, allow_nan=False)
+        return data
 
     def _send_json(self, data: Dict, status: int = 200):
         response = json.dumps(data, default=str).encode()
@@ -294,6 +297,8 @@ class _APIHandler(BaseHTTPRequestHandler):
             else:
                 # Fallback for non-ToolResult returns
                 self._send_json({"success": True, "data": {"output": str(result)}, "message": str(result)})
+        except (ValueError, OverflowError):
+            self._send_json({'success': False, 'error': 'invalid_arguments'}, 400)
         except Exception as e:
             self._send_internal_error(e, op="call")
 
@@ -378,6 +383,9 @@ class _APIHandler(BaseHTTPRequestHandler):
                         "error": f"Prediction '{key}' fields point/lower/upper must all be numbers, got {entry!r}.",
                     }, 400)
                     return
+                if not all(math.isfinite(value) for value in (point, lower, upper)):
+                    self._send_json({'success': False, 'error': 'Forecasts must be finite'}, 400)
+                    return
                 if lower > upper:
                     self._send_json({
                         "success": False,
@@ -431,7 +439,16 @@ class _APIHandler(BaseHTTPRequestHandler):
                         cursor = server.conn.execute(sql)
                         try:
                             columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                            rows_raw = cursor.fetchmany(_QUERY_ROW_LIMIT + 1)
+                            rows_raw = []
+                            byte_count = 0
+                            for row in cursor:
+                                byte_count += len(json.dumps(dict(row), default=str).encode())
+                                if byte_count > 1024 * 1024:
+                                    self._send_json({'success': False, 'error': 'Query exceeds 1 MiB; narrow the result.'}, 400)
+                                    return
+                                rows_raw.append(row)
+                                if len(rows_raw) > _QUERY_ROW_LIMIT:
+                                    break
                         finally:
                             cursor.close()
                 finally:
@@ -708,6 +725,10 @@ class NovaMindAPIServer:
         with self._lock:
             if self._unrecoverable:
                 return {"success": False, "error": "unrecoverable_session"}
+            if not readonly and self.simulator is not None and (
+                    self.simulator.shutdown_mode or self.tools.current_day >= self.simulator.config.total_days):
+                if not self.journal or not self.journal.lookup(request_id).get('result'):
+                    return {'success': False, 'error': 'game_over_bankrupt' if self.simulator.shutdown_mode else 'game_over_horizon'}
             if readonly or self.journal is None:
                 return callback()
             self._busy = True
@@ -738,6 +759,13 @@ class NovaMindAPIServer:
             dispatch_fn = _TOOL_DISPATCH.get(tool_name)
             if dispatch_fn is None:
                 return ToolResult(False, f"Unknown tool: {tool_name}")
+            if (self.simulator is not None and not tool_name.startswith(('get_', 'list_'))
+                    and (self.simulator.shutdown_mode or self.tools.current_day >= self.simulator.config.total_days)):
+                return ToolResult(False, "Game has ended")
+            try:
+                json.dumps(args, allow_nan=False)
+            except (ValueError, TypeError, OverflowError):
+                return ToolResult(False, "Arguments must be finite JSON values")
             return dispatch_fn(self.tools, args)
 
     # Maximum allowed time for step_week before auto-quit (seconds)
@@ -778,6 +806,8 @@ class NovaMindAPIServer:
             if self.simulator is None:
                 return {"success": False, "error": "No simulator configured"}
             old_day = self.tools.current_day
+            if old_day >= self.simulator.config.total_days:
+                return {'success': False, 'error': 'game_over_horizon', 'day': old_day}
             # Bankruptcy ends the game (cash < 0). The in-memory flag is lost on a server
             # restart, but the negative balance is persisted, so check both.
             if self.simulator.shutdown_mode or (self.conn is not None and get_cash(self.conn) < 0):
@@ -816,13 +846,10 @@ class NovaMindAPIServer:
                 # back-pressure the lock holder. (run 27c000a5 d105 hang.)
                 print(_pred_exc_tb, file=sys.stderr, flush=True)
 
-        # Check for shocks BEFORE step_week (so shock effects apply this week)
-        if self.shock_manager:
-            for d in range(old_day + 1, old_day + 8):
-                new_shocks = self.shock_manager.check_and_generate_shocks(d)
+        def generate_shocks(day):
+            for shock in self.shock_manager.check_and_generate_shocks(day):
                 if self.event_logger:
-                    for shock in new_shocks:
-                        self.event_logger.log_shock(shock.shock_type, shock.details)
+                    self.event_logger.log_shock(shock.shock_type, shock.details)
 
         # Run step_week in a worker thread so we can enforce a timeout.
         _step_start = _time.monotonic()
@@ -830,7 +857,7 @@ class NovaMindAPIServer:
         # Never abandon a live worker and expose its partially mutated DB.
         # A client timeout leaves this same request running; process loss leaves
         # a durable pending journal entry and is unrecoverable on resume.
-        week_result = self.simulator.step_week()
+        week_result = self.simulator.step_week(generate_shocks) if self.shock_manager else self.simulator.step_week()
 
         self._last_step_elapsed = _time.monotonic() - _step_start
         new_day = week_result.day
@@ -877,6 +904,8 @@ class NovaMindAPIServer:
         }
         if self.simulator.shutdown_mode:
             result["game_over"] = "bankrupt"
+        elif new_day >= self.simulator.config.total_days:
+            result["game_over"] = "horizon"
         return result
 
     @property

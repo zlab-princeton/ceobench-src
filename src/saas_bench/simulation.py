@@ -273,6 +273,12 @@ class Simulator:
 
     # === L3-L5 Performance: Per-step_day cached state ===
     # These are populated once at the start of step_day and reused by all functions
+    _today_overload = 0.0
+    _today_outage = False
+
+    def _service_penalty(self, overload, outage):
+        return self.config.service_overload_weight * overload + self.config.service_outage_weight * bool(outage)
+
     _cached_q_shared_bonus: float = 0.0
     _cached_compute_cost_multiplier: float = 1.0
     _cached_q_shared_per_plan: dict = None  # {plan: q_shared} for A, B, C
@@ -393,18 +399,12 @@ class Simulator:
             weekly_usage_mult, _ = self._get_cycle_multipliers(self.current_day)
         daily_demand = daily_usage_rate * weekly_usage_mult
         plan_quota = config.get(f'quota_{plan}', 100)
-        quota_factor = compute_quota_quality_factor(plan_quota, daily_demand)
+        quota_factor = compute_quota_quality_factor(plan_quota * int(sub_row['seat_count'] or 1), daily_demand)
 
         # Ads penalty
         ads_sensitivity = sub_row['ads_quality_sensitivity'] or 0.0
-        ads_penalty = 0.0
-        if ads_sensitivity > 0 and group_id:
-            ads_global = self.config.ads_strength_global
-            ads_group = self.config.ads_strength_by_group.get(group_id, 0.0)
-            strength = min(max(ads_global + ads_group, 0.0), 1.0)
-            if strength > 0:
-                effective_ads = math.log(1.0 + 9.0 * strength) / math.log(10.0)
-                ads_penalty = ads_sensitivity * effective_ads
+        ads_penalty = ads_sensitivity * self._get_effective_ads_strength(sub_row['customer_id'], group_id)
+        q_shared -= self._service_penalty(overload, outage)
 
         quality_before_incident_penalties = q_shared + relationship_bonus + stickiness_bonus
         return quality_before_incident_penalties * quota_factor - issue_penalty - ads_penalty
@@ -1183,7 +1183,7 @@ class Simulator:
 
         usage_demand = customer['usage_demand'] if customer else 50.0
         seat_count = int(customer['seat_count'] or 1)
-        relationship = customer['relationship'] if customer and customer['relationship'] else 0.5
+        relationship = customer['relationship'] if customer and customer['relationship'] is not None else 0.5
 
         # Today's quota comparison uses the sampled billing-period demand rate
         # after the weekly usage cycle multiplier.
@@ -1214,11 +1214,11 @@ class Simulator:
 
         # Quota quality factor: applies when today's usage is being throttled
         plan_quota = config.get(f'quota_{plan}', 100)  # Default to 100 if not set
-        quota_factor = compute_quota_quality_factor(plan_quota, daily_demand)
+        quota_factor = compute_quota_quality_factor(plan_quota * seat_count, daily_demand)
 
         # Perceived quality = (delivered quality + bonuses) × quota factor
         quality_before_quota = q_shared + relationship_bonus + stickiness_bonus
-        Q_perceived = quality_before_quota * quota_factor
+        Q_perceived = (quality_before_quota - self._service_penalty(overload, outage)) * quota_factor
 
         return Q_perceived
 
@@ -1898,6 +1898,12 @@ class Simulator:
 
         return cancellations, quality_cancellations, upgrades, downgrades, churn_events
 
+    def _prospect_quality(self, params, delivered, quota):
+        factor = compute_quota_quality_factor(quota, params.get('usage_demand', params.get('usage_scale', 50.0)))
+        penalty = self._service_penalty(self._today_overload, self._today_outage)
+        ads = self._get_effective_ads_strength(None, params.get('group_id'))
+        return (delivered - penalty) * factor - params.get('ads_quality_sensitivity', 0.0) * ads
+
     def _generate_new_customers(self, config: dict) -> dict:
         """Generate new customers using a simple, interpretable growth model per group.
 
@@ -1948,6 +1954,11 @@ class Simulator:
             GROUP BY c.group_id
         """).fetchall()
         subs_per_group = {row['group_id']: row['cnt'] for row in sub_by_group}
+
+        reserved = {row['group_id']: row['cnt'] for row in self.conn.execute("""
+            SELECT c.group_id, COUNT(*) AS cnt FROM subscriptions s JOIN customers c USING(customer_id)
+            WHERE s.status='lead' AND s.end_day IS NULL GROUP BY c.group_id
+        """)}
 
         # Track per-channel leads for each group (for acquisition source attribution)
         # Structure: {group_id: {channel_id: expected_leads, ...}}
@@ -2014,7 +2025,7 @@ class Simulator:
             # Growth slows as subscribers approach market cap
             # cap(t) = base_cap * (1 + annual_growth * t/365)
             # demand_multiplier = max(0, 1 - (current_subs / cap(t))^2)
-            current_subs = subs_per_group.get(group_id, 0)
+            current_subs = subs_per_group.get(group_id, 0) + reserved.get(group_id, 0)
             market_cap_t = group.base_market_cap * (1 + group.annual_cap_growth_rate * self.current_day / 365.0)
             if market_cap_t > 0 and current_subs > 0:
                 saturation_ratio = current_subs / market_cap_t
@@ -2040,6 +2051,7 @@ class Simulator:
 
             # Sample from Poisson distribution
             n_new = self.rng.poisson(max(0, daily_leads))
+            n_new = min(n_new, max(0, int(market_cap_t) - current_subs))
             leads_by_group[group_id] = n_new
 
             # Record all multipliers for post-run analysis (hidden from agent)
@@ -2121,8 +2133,9 @@ class Simulator:
                 q_min = params.get('q_min', 0.25)
                 q_min, q_max, c_max = self._apply_drift_offsets(group_id, q_min, q_max, c_max)
 
+                c_max *= self.get_macro_multiplier(group_id, 'willingness_to_pay')
                 lead_promo = self._get_lead_promotion(group_id, channel=lead_channel)
-                effective_price = max(0.0, price - lead_promo)
+                _, effective_price = self._compute_first_period_subscription_pricing(None, group_id, best_plan, price, lead_promo)
                 # Persist the exact first-period lead pricing used for this
                 # conversion decision so subscription creation cannot lose
                 # channel/group targeting context later.
@@ -2133,13 +2146,9 @@ class Simulator:
                 tier_multiplier = MODEL_TIERS[tier].quality_multiplier
                 base_quality = product_quality * tier_multiplier
 
-                usage_demand = params.get('usage_demand', 50.0)
-                seat_count = int(params.get('seat_count', 1) or 1)
-                daily_demand = usage_demand * seat_count
                 plan_quota = config.get(f'quota_{best_plan}', 100)
 
-                quota_factor = compute_quota_quality_factor(plan_quota, daily_demand)
-                quality = base_quality * quota_factor
+                quality = self._prospect_quality(params, base_quality, plan_quota)
 
                 # Initial-decision perceived-quality noise (individual customers only).
                 # Enterprise customers receive their noise during negotiation evaluations,
@@ -2160,8 +2169,7 @@ class Simulator:
                         tier_check = config[f'tier_{plan_check}']
                         tier_mult_check = MODEL_TIERS[tier_check].quality_multiplier
                         plan_quota_check = config.get(f'quota_{plan_check}', 100)
-                        quota_factor_check = compute_quota_quality_factor(plan_quota_check, daily_demand)
-                        q_check = product_quality * tier_mult_check * quota_factor_check
+                        q_check = self._prospect_quality(params, product_quality * tier_mult_check, plan_quota_check)
                         q_req_at_zero = self._compute_required_quality(
                             0, steepness_left, steepness_right, c_max, q_max, q_min)
                         if q_check >= q_req_at_zero:
@@ -2441,6 +2449,8 @@ class Simulator:
         best_plan = 'A'
         best_satisfaction = float('-inf')
 
+        c_max *= self.get_macro_multiplier(group_id, 'willingness_to_pay')
+
         # Use cached q_shared_bonus (avoids per-call DB query)
         q_shared_bonus = self._cached_q_shared_bonus
 
@@ -2457,15 +2467,13 @@ class Simulator:
         for plan in ['A', 'B', 'C']:
             price = config[f'price_{plan}']
             # Apply lead promotion to effective price (floored at 0)
-            effective_price = max(0.0, price - lead_promo)
+            _, effective_price = self._compute_first_period_subscription_pricing(None, group_id, plan, price, lead_promo)
             tier = config[f'tier_{plan}']
             # delivered = (base_product_quality + q_shared_bonus + q_group_bonus) × tier_multiplier
             tier_multiplier = MODEL_TIERS[tier].quality_multiplier
             product_quality = _base_pq
-            daily_demand = params.get('usage_demand', params.get('usage_scale', 50.0)) * int(params.get('seat_count', 1) or 1)
             plan_quota = config.get(f'quota_{plan}', 100)
-            quota_factor = compute_quota_quality_factor(plan_quota, daily_demand)
-            quality = product_quality * tier_multiplier * quota_factor
+            quality = self._prospect_quality(params, product_quality * tier_multiplier, plan_quota)
 
             # Budget constraint (use effective price after promotion)
             if effective_price > c_max:
@@ -2524,11 +2532,11 @@ class Simulator:
             SELECT ?, s.customer_id,
                    CAST(ROUND(MIN(
                        COALESCE(s.daily_usage_rate, 0.0) * ?,
-                       MAX(0.0, CASE s.plan
+                       MAX(1, CAST(COALESCE(c.seat_count, 1) AS INTEGER)) * MAX(0.0, CASE s.plan
                            WHEN 'A' THEN ? WHEN 'B' THEN ? WHEN 'C' THEN ? ELSE 100 END
                        )
                    )) AS INTEGER)
-            FROM subscriptions s
+            FROM subscriptions s JOIN customers c USING(customer_id)
             WHERE s.status = 'subscribed' AND s.end_day IS NULL
         """, (_day, weekly_mult, quota_A, quota_B, quota_C))
 
@@ -2897,7 +2905,7 @@ class Simulator:
             eff_price_np[i] = ep if ep else 0.0
 
             rel = sub['relationship']
-            relationship_np[i] = rel if rel else 0.5
+            relationship_np[i] = rel if rel is not None else 0.5
 
             open_issue_days_np[i] = sub['open_issue_days']
             days_subscribed_np[i] = _current_day - sub['start_day']
@@ -3001,7 +3009,7 @@ class Simulator:
 
         # Quota quality factor
         total_demand_np = daily_usage_np * _weekly_usage_mult
-        plan_quota_per_row = plan_quota_arr[plan_idx_np]
+        plan_quota_per_row = plan_quota_arr[plan_idx_np] * seat_count_np
         quota_factor_np = np.ones_like(total_demand_np, dtype=np.float64)
         positive_demand_mask = total_demand_np > 0.0
         np.divide(
@@ -3115,6 +3123,7 @@ class Simulator:
             'group_idx': group_idx_np,
             'unique_groups': unique_groups,
             'n_customers': n,
+            'seats': seat_count_np,
         }
 
         return customer_events
@@ -3274,7 +3283,7 @@ class Simulator:
 
                 if issue_days <= self.config.quick_resolution_threshold_days and not outage:
                     relationship_boost = self.config.quick_resolution_boost_1day if issue_days == 1 else self.config.quick_resolution_boost_2day
-                    current_relationship = sub['relationship'] or 0.5
+                    current_relationship = sub['relationship'] if sub['relationship'] is not None else 0.5
                     new_relationship = min(1.0, current_relationship + relationship_boost)
                     resolved_with_boost.append((new_relationship, sub['customer_id']))
                 else:
@@ -3318,7 +3327,7 @@ class Simulator:
             unresolved_updates = []  # (new_relationship, customer_id)
             for sub in subscribers_with_issues:
                 if sub['customer_id'] not in resolved_customer_ids:
-                    current_relationship = sub['relationship'] or 0.5
+                    current_relationship = sub['relationship'] if sub['relationship'] is not None else 0.5
                     new_relationship = max(0.0, current_relationship - self.config.relationship_decay_per_unresolved_day)
                     unresolved_updates.append((new_relationship, sub['customer_id']))
 
@@ -3779,10 +3788,10 @@ class Simulator:
             unique_groups_list = _sat_arrs['unique_groups']
             # Sign-dependent: rep_delta = BASE * sat (positive) OR 2*BASE*sat (negative)
             multipliers = np.where(sat_arr_np >= 0, 1.0, 2.0)
-            deltas_np = BASE_REP_PER_CUSTOMER * sat_arr_np * multipliers
+            deltas_np = BASE_REP_PER_CUSTOMER * sat_arr_np * multipliers * _sat_arrs['seats']
             n_grps = len(unique_groups_list)
             delta_sums = np.bincount(gid_idx_np, weights=deltas_np, minlength=n_grps)
-            count_sums = np.bincount(gid_idx_np, minlength=n_grps)
+            count_sums = np.bincount(gid_idx_np, weights=_sat_arrs['seats'], minlength=n_grps)
             for gi, gid in enumerate(unique_groups_list):
                 cnt = int(count_sums[gi])
                 if cnt > 0:
@@ -3803,8 +3812,9 @@ class Simulator:
                 rep_delta = BASE_REP_PER_CUSTOMER * satisfaction
             else:
                 rep_delta = -BASE_REP_PER_CUSTOMER * abs(satisfaction) * 2.0
-            group_rep_deltas[group_id] += rep_delta
-            group_rep_counts[group_id] += 1
+            seat_count = int(events.get('seat_count', 1) or 1)
+            group_rep_deltas[group_id] += rep_delta * seat_count
+            group_rep_counts[group_id] += seat_count
 
             # On suppressed days, skip candidate construction entirely (saves
             # ~9.8M iterations of weight math + dict creation per week).
@@ -3814,7 +3824,6 @@ class Simulator:
             days_subscribed = events['days_subscribed']
             active_events = events['events']
             satisfaction_change = events['satisfaction_change']
-            seat_count = int(events.get('seat_count', 1) or 1)
 
             # --- Unified weight (same for rep impact and sampling) ---
             weight = 1.0
@@ -4881,20 +4890,20 @@ class Simulator:
     def _process_research_projects(self, config: dict):
         """Process active research tier invocations: check completion and apply quality boosts.
 
-        Invocations complete when current_day >= expected_completion_day.
-        On completion: apply the sampled quality_boost (stored in expected_quality_boost) to q_shared.
+        Complete on the privately sampled day and apply the realized boost to q_shared.
         Tiers are repeatable — multiple invocations of the same tier can complete over time.
         """
         # Check for invocation completions
         completing = self.conn.execute("""
-            SELECT project_id, tier, expected_quality_boost FROM research_projects
-            WHERE status = 'in_progress' AND expected_completion_day <= ?
+            SELECT project_id, tier, quality_boost FROM research_projects
+            JOIN _hidden_research_outcomes USING(project_id)
+            WHERE status = 'in_progress' AND completion_day <= ?
         """, (self.current_day,)).fetchall()
 
         for row in completing:
             invocation_id = row['project_id']
             tier_num = row['tier']
-            quality_boost = row['expected_quality_boost']
+            quality_boost = row['quality_boost']
             rt = RESEARCH_TIERS_BY_ID.get(tier_num)
             tier_name = rt.name if rt else f"Tier {tier_num}"
 
@@ -5291,7 +5300,8 @@ Requirements:
             cfg.macro_social_post_count_max + 1
         ))
 
-        pmi = self._macro_pmi_current
+        published = self.conn.execute("SELECT pmi_value FROM macroeconomic_conditions ORDER BY day DESC LIMIT 1").fetchone()
+        pmi = published[0] if published else cfg.macro_pmi_initial
         trend = self._get_pmi_trend_label(pmi)
 
         # Get recent macro posts to avoid repetition
@@ -5770,19 +5780,15 @@ Requirements:
 
 Competitor: {competitor_name}
 Event: {event_description}
-Your perceived quality boost: {noisy_boost:.4f}
 Severity level: {severity}
 
 {severity_guidance[severity]}
-
-This number ({noisy_boost:.4f}) is YOUR subjective perception of how much the competitor improved — based on your personal experience testing the product, reading early reviews, or talking to beta users. Different observers may perceive the improvement differently. You believe it to be a {noisy_boost:.4f} quality boost based on what you've seen.
 
 Context: {product_name} is an existing player in this space. The competitor's improvement puts pressure on {product_name} and similar tools.
 
 Guidelines:
 - Write a single, authentic social media post (1-3 sentences, under 100 words)
-- You MUST explicitly mention the quality boost number ({noisy_boost:.4f}) somewhere in your post, framed as your own estimate or perception — e.g. "from what I've seen, about a {noisy_boost:.4f} quality boost" or "I'd estimate a {noisy_boost:.4f} improvement" or "my testing suggests a {noisy_boost:.4f} bump"
-- Calibrate your reaction to the magnitude: {noisy_boost:.4f} is {'barely noticeable' if noisy_boost < self.config.competitor_severity_minor_max else 'notable' if noisy_boost < self.config.competitor_severity_moderate_max else 'very significant' if noisy_boost < self.config.competitor_severity_major_max else 'massive and market-changing'}
+- Describe the impact qualitatively; do not give a numerical estimate.
 - Vary your style — sometimes use hashtags, sometimes don't; sometimes tag companies, sometimes don't
 - Sound like a real person, not a press release
 - Output ONLY the post text, nothing else."""
@@ -5826,10 +5832,8 @@ Guidelines:
 
         return post_text
 
-    @staticmethod
-    def _generate_competitor_post_template(competitor_name: str, severity: str) -> str:
+    def _generate_competitor_post_template(self, competitor_name: str, severity: str) -> str:
         """Fallback template-based competitor post generation."""
-        import random as _random
         templates_by_severity = {
             'minor': [
                 "Interesting update from {competitor}. Nothing game-changing but shows they're still iterating.",
@@ -5861,12 +5865,23 @@ Guidelines:
             ],
         }
         templates = templates_by_severity[severity]
-        template = _random.choice(templates)
+        template = templates[(self.current_day + sum(map(ord, competitor_name))) % len(templates)]
         return template.format(competitor=competitor_name)
 
     # =========================================================================
     # Enterprise Negotiation Processing
     # =========================================================================
+
+    def _live_enterprise_threads(self):
+        return {
+            row['customer_id']: (row['thread_id'], row['thread_type'])
+            for row in self.conn.execute("""
+                SELECT customer_id, thread_id, thread_type FROM enterprise_turns
+                WHERE closed=0 AND _internal_status IS NULL AND message_id IN (
+                    SELECT MAX(message_id) FROM enterprise_turns GROUP BY thread_id
+                )
+            """)
+        }
 
     def _process_enterprise_negotiations(self, config: dict) -> list:
         """Process enterprise customer negotiations - replies and triggers.
@@ -5902,6 +5917,17 @@ Guidelines:
         """)
         _ent_timings['latest_turns_cache'] = _time.monotonic() - _t0
 
+        expired = self.conn.execute("""
+            SELECT t.thread_id, t.customer_id FROM _tmp_latest_turns t
+            JOIN subscriptions s USING(customer_id)
+            WHERE t.thread_type='new_lead' AND s.status='lead' AND s.start_day <= ?
+        """, (self.current_day - 90,)).fetchall()
+        for row in expired:
+            close_enterprise_thread(self.conn, row['thread_id'], 'lead_expired')
+            self.conn.execute("UPDATE subscriptions SET status='lost', end_day=? WHERE customer_id=? AND status='lead'",
+                              (self.current_day, row['customer_id']))
+            self.conn.execute("DELETE FROM _tmp_latest_turns WHERE thread_id=?", (row['thread_id'],))
+
         # Process agent response timeouts using cached latest turns
         _t0 = _time.monotonic()
         self._process_agent_response_timeouts(config, enterprise_churn_events)
@@ -5909,25 +5935,12 @@ Guidelines:
 
         # Process scheduled customer replies using cached latest turns
         _t0 = _time.monotonic()
+        self._signing_counts = get_group_subscriber_counts(self.conn)
         self._process_scheduled_replies(config, enterprise_churn_events)
+        self._signing_counts = None
         _ent_timings['scheduled_replies'] = _time.monotonic() - _t0
 
-        # L6+L9: Pre-compute set of customer_ids with active enterprise threads
-        # from the cached temp table (instant — no GROUP BY needed).
-        _t0 = _time.monotonic()
-        active_thread_customers = set()
-        payment_suspended_customers = set()
-        rows = self.conn.execute(
-            "SELECT DISTINCT customer_id, thread_type FROM _tmp_latest_turns"
-        ).fetchall()
-        for row in rows:
-            active_thread_customers.add(row['customer_id'])
-            if row['thread_type'] == 'churn_prevention':
-                payment_suspended_customers.add(row['customer_id'])
-        # Cache for _process_billing: enterprise customers with active churn_prevention
-        # threads have payment suspended (sat was < 0 when thread was created)
-        self._payment_suspended_customers = payment_suspended_customers
-        _ent_timings['active_threads_query'] = _time.monotonic() - _t0
+        active_thread_customers = self._live_enterprise_threads()
 
         # Check for new negotiation triggers
         _t0 = _time.monotonic()
@@ -5936,7 +5949,7 @@ Guidelines:
 
         # V2.1: Check for contract renewals
         _t0 = _time.monotonic()
-        self._process_contract_renewals(config, active_thread_customers)
+        self._process_contract_renewals(config, self._live_enterprise_threads())
         _ent_timings['contract_renewals'] = _time.monotonic() - _t0
 
         # Clean up temp table
@@ -6028,6 +6041,8 @@ Guidelines:
                 dead_thread_ids.append(thread_id)
                 notification_rows.append((self.current_day, 'lead_lost',
                     f'Lead lost: No response for {days_waiting} days'))
+            elif thread_type in ('renegotiation', 'plan_change'):
+                dead_thread_ids.append(thread_id)
             else:
                 # All non-lead types: renegotiation, renewal, churn_prevention, plan_change
                 sub = sub_map.get(customer_id)
@@ -6105,7 +6120,7 @@ Guidelines:
             # Batch mark threads dead — chunked UPDATE so we don't blow past
             # SQLITE_MAX_VARIABLE_NUMBER when many threads time out at once.
             chunked_execute(self.conn, """
-                UPDATE enterprise_turns SET _internal_status = 'timeout'
+                UPDATE enterprise_turns SET closed = 1, close_reason = 'timeout', _internal_status = 'timeout'
                 WHERE message_id IN (
                     SELECT MAX(message_id) FROM enterprise_turns
                     WHERE thread_id IN ({ph})
@@ -6153,7 +6168,8 @@ Guidelines:
 
         # Batch-fetch qualities for all customers (1 query instead of 3*N)
         customer_ids = [s.customer_id for s in states_map.values()]
-        qualities_map = get_qualities_for_all_plans_batch(self.conn, customer_ids, self.config)
+        qualities_map = get_qualities_for_all_plans_batch(self.conn, customer_ids, self.config,
+            service_penalty=self._service_penalty(self._today_overload, self._today_outage), day=self.current_day)
 
         # Batch-fetch last agent turns for all threads (1 query per chunk).
         # Chunked so we don't trip SQLITE_MAX_VARIABLE_NUMBER when many threads
@@ -6175,6 +6191,7 @@ Guidelines:
             if not state:
                 continue
 
+            state.c_max *= self.get_macro_multiplier(state.group_id, 'willingness_to_pay')
             qualities = qualities_map.get(state.customer_id, {'A': 0.5, 'B': 0.5, 'C': 0.5})
 
             # Initial-negotiation perceived-quality noise (enterprise only).
@@ -6284,7 +6301,7 @@ Guidelines:
                 f'Lead ghosted'
             )
 
-        elif state.thread_type in ('churn_prevention', 'plan_change', 'renewal'):
+        elif state.thread_type in ('churn_prevention', 'renewal'):
             # Existing customer churns at contract end (or immediately if month-to-month)
             sub = self.conn.execute("""
                 SELECT plan, listed_price, contract_end_day FROM subscriptions
@@ -6343,62 +6360,6 @@ Guidelines:
             # Damage relationship
             update_relationship(self.conn, customer_id, -0.2)
 
-        elif state.thread_type == 'renegotiation':
-            # Agent-initiated renegotiation ghosted — customer churns
-            sub = self.conn.execute("""
-                SELECT plan, listed_price FROM subscriptions
-                WHERE customer_id = ? AND status = 'subscribed' AND end_day IS NULL
-            """, (customer_id,)).fetchone()
-
-            # V2.1: Detect churn reason
-            ent_info = {'plan': sub['plan']} if sub else {'plan': 'A'}
-            churn_reason = self._detect_churn_reason(customer_id, ent_info, config)
-            churn_reason_val = churn_reason.value if churn_reason else None
-
-            self.conn.execute("""
-                UPDATE subscriptions SET status = 'cancelled', end_day = ?, churn_reason = ?
-                WHERE customer_id = ? AND status = 'subscribed' AND end_day IS NULL
-            """, (self.current_day, churn_reason_val, customer_id))
-
-            update_relationship(self.conn, customer_id, -0.3)
-
-            cust = self.conn.execute(
-                "SELECT group_id FROM customers WHERE customer_id = ?",
-                (customer_id,)
-            ).fetchone()
-            group_id = cust['group_id'] if cust else None
-            if group_id:
-                damage = self.config.reputation_quality_cancel_damage * (0.5 + self.rng.random()) * self._get_rep_event_scale(group_id)
-                current_rep = get_group_reputation(self.conn, group_id)
-                new_rep = clamp(current_rep - damage, 0.0, 1.0)
-                set_group_reputation(self.conn, group_id, new_rep, self.current_day,
-                                   reason='renegotiation_ghost_churn')
-
-                # Collect social media event for sampling (instead of serial LLM call)
-                sub_info = self.conn.execute("""
-                    SELECT start_day FROM subscriptions
-                    WHERE customer_id = ? AND status = 'cancelled'
-                    ORDER BY end_day DESC LIMIT 1
-                """, (customer_id,)).fetchone()
-                days_subscribed = (self.current_day - sub_info['start_day']) if sub_info else 30
-                cust_seat = self.conn.execute(
-                    "SELECT seat_count FROM customers WHERE customer_id = ?",
-                    (customer_id,)
-                ).fetchone()
-                enterprise_churn_events.append({
-                    'customer_id': customer_id,
-                    'group_id': group_id,
-                    'satisfaction': 0.2,
-                    'days_subscribed': days_subscribed,
-                    'seat_count': int(cust_seat['seat_count'] or 1) if cust_seat else 1,
-                    'post_type': 'renegotiation_churn',
-                    'event_context': {
-                        'event_type': 'renegotiation_ghost',
-                        'reputation_event': 'renegotiation_ghost_churn',
-                        'reason': 'customer_ghosted_renegotiation'
-                    },
-                })
-
     def _finalize_deal(self, thread_id: int, state, final_price: float, agent_offer: Optional[Dict]):
         """Finalize an accepted enterprise deal.
 
@@ -6437,11 +6398,21 @@ Guidelines:
         """, (customer_id,)).fetchone()
         deal_group_id = cust_row['group_id'] if cust_row else 'E1'
         deal_c_max = (cust_row['current_c_max'] or cust_row['c_max']) if cust_row else 100.0
-        deal_plan = agreed_plan or 'C'  # Enterprise typically on plan C
-        deal_promo = self._get_effective_promotion(customer_id, deal_group_id, deal_plan)
+        deal_promo = 0.0
         deal_eff_price = max(0.0, agreed_price - deal_promo)
 
         if state.thread_type == 'new_lead':
+            group = CUSTOMER_GROUPS[deal_group_id]
+            cap = int(group.base_market_cap * (1 + group.annual_cap_growth_rate * self.current_day / 365))
+            counts = getattr(self, '_signing_counts', None)
+            if counts is None:
+                counts = get_group_subscriber_counts(self.conn)
+            if counts.get(deal_group_id, 0) >= cap:
+                self.conn.execute("UPDATE subscriptions SET status='lost', end_day=? WHERE customer_id=? AND status='lead'",
+                                  (self.current_day, customer_id))
+                close_enterprise_thread(self.conn, thread_id, 'market_full')
+                return
+            counts[deal_group_id] = counts.get(deal_group_id, 0) + 1
             # Convert lead to subscribed
             customer = self.conn.execute("""
                 SELECT usage_scale, seat_count FROM customers WHERE customer_id = ?
@@ -6570,7 +6541,7 @@ Guidelines:
                 seat_count=seat_count
             )
 
-    def _check_negotiation_triggers(self, config: dict, active_thread_customers: set = None):
+    def _check_negotiation_triggers(self, config: dict, active_thread_customers: dict = None):
         """Check for conditions that trigger new enterprise negotiations.
 
         V2.1: Contract-aware — churn_prevention and plan_change only trigger
@@ -6578,12 +6549,11 @@ Guidelines:
         (or on month-to-month with contract_months=1).
 
         Args:
-            active_thread_customers: Pre-computed set of customer_ids with active threads.
-                If None, falls back to per-customer query (backward compat).
+            active_thread_customers: Live thread ID and type keyed by customer.
         """
         # Get all enterprise customers with subscriptions and asymmetric sigmoid curve params
         enterprises = self.conn.execute("""
-            SELECT c.customer_id, c.group_id, CAST(c.seat_count AS INTEGER) as seat_count,
+            SELECT c.customer_id, c.group_id, s.billing_day_mod30, CAST(c.seat_count AS INTEGER) as seat_count,
                    COALESCE(cs.current_q_max, c.q_max) as q_max,
                    COALESCE(cs.current_q_min, c.q_min) as q_min,
                    c.steepness_left as initial_steepness_left, c.steepness_right as initial_steepness_right,
@@ -6603,24 +6573,24 @@ Guidelines:
 
         weekly_usage_mult, _ = self._get_cycle_multipliers(self.current_day)
 
+        if active_thread_customers is None:
+            active_thread_customers = self._live_enterprise_threads()
         for ent in enterprises:
             customer_id = ent['customer_id']
 
-            # L6: Use pre-computed active thread set instead of per-customer subquery
-            if active_thread_customers is not None:
-                if customer_id in active_thread_customers:
-                    continue  # Already has an active negotiation
-            else:
-                # Fallback: per-customer query (backward compat)
-                active_thread = self.conn.execute("""
-                    SELECT et.thread_id FROM enterprise_turns et
-                    WHERE et.customer_id = ?
-                      AND et.message_id = (SELECT MAX(et2.message_id) FROM enterprise_turns et2 WHERE et2.thread_id = et.thread_id)
-                      AND et.closed = 0
-                      AND et._internal_status IS NULL
-                """, (customer_id,)).fetchone()
-                if active_thread:
-                    continue  # Already has an active negotiation
+            thread = active_thread_customers.get(customer_id)
+            if (ent['contract_months'] or 1) == 1 and ent['start_day'] < self.current_day and ent['billing_day_mod30'] == self.current_day % 30:
+                probability = self._get_involuntary_churn_mu(ent['group_id'])
+                if probability > 0 and self.rng.random() < probability:
+                    self.conn.execute("""
+                        UPDATE subscriptions SET status='cancelled', end_day=?, churn_reason=?
+                        WHERE customer_id=? AND status='subscribed'
+                    """, (self.current_day, ChurnReason.INVOLUNTARY.value, customer_id))
+                    if thread:
+                        close_enterprise_thread(self.conn, thread[0], 'involuntary')
+                    continue
+            if thread and thread[1] not in ('renegotiation', 'plan_change'):
+                continue
 
             # V2.1: Contract-aware — only allow churn/plan_change triggers
             # when within pre-expiry window or on month-to-month
@@ -6640,40 +6610,9 @@ Guidelines:
             # Get current perceived quality — include ALL terms that affect daily satisfaction
             plan = ent['plan']
             group_id = ent['group_id']
-            relationship = ent['relationship'] or 0.5
-            rel_bonus = self.config.relationship_quality_bonus_max * (relationship - 0.5) * 2
-
-            q_shared = self._cached_q_shared_per_plan.get(plan, 0.5)
-            # Add per-group quality bonus (from R&D investments) × tier multiplier
-            if self._cached_q_group_bonus and group_id in self._cached_q_group_bonus:
-                q_shared += self._cached_q_group_bonus[group_id] * self._cached_tier_multiplier_per_plan.get(plan, 1.0)
-
-            # Stickiness bonus (loyalty from tenure)
-            days_subscribed = self.current_day - ent['start_day'] if ent['start_day'] else 0
-            stickiness_bonus = self.config.stickiness_log_scale * math.log(1 + days_subscribed / 30) if days_subscribed > 0 else 0.0
-
-            # Issue penalty (unresolved support tickets)
-            issue_penalty = 0.03 * (ent['open_issue_days'] or 0)
-
-            # Quota quality factor (use actual sampled daily_usage_rate, consistent with satisfaction loop)
-            daily_usage_rate = ent['daily_usage_rate'] if ent['daily_usage_rate'] else 0.0
-            total_demand = daily_usage_rate * weekly_usage_mult
-            plan_quota = config.get(f'quota_{plan}', 100) if config else 100
-            quota_factor = compute_quota_quality_factor(plan_quota, total_demand)
-
-            # Ads penalty
-            ads_sensitivity = ent['ads_quality_sensitivity'] or 0.0
-            ads_penalty = 0.0
-            if ads_sensitivity > 0:
-                ads_global = self.config.ads_strength_global
-                ads_group = self.config.ads_strength_by_group.get(group_id, 0.0)
-                strength = min(max(ads_global + ads_group, 0.0), 1.0)
-                if strength > 0:
-                    effective_ads = math.log(1.0 + 9.0 * strength) / math.log(10.0)
-                    ads_penalty = ads_sensitivity * effective_ads
-
-            quality_before_incident_penalties = q_shared + rel_bonus + stickiness_bonus
-            quality = quality_before_incident_penalties * quota_factor - issue_penalty - ads_penalty
+            quality = self._compute_comprehensive_quality_inline(
+                ent, plan, config, self._today_overload, self._today_outage, weekly_usage_mult
+            )
 
             # Get asymmetric sigmoid params (use drifted values + drift offsets)
             steepness_left = ent['current_steepness_left'] or ent['initial_steepness_left']
@@ -6684,16 +6623,19 @@ Guidelines:
             q_min, q_max, c_max = self._apply_drift_offsets(ent['group_id'], q_min, q_max, c_max)
 
             # Check participation constraint using asymmetric sigmoid curve
+            c_max *= self.get_macro_multiplier(group_id, 'willingness_to_pay')
             price = ent['listed_price']
             satisfaction = self._compute_satisfaction(steepness_left, steepness_right, c_max, quality, price, q_max, q_min)
 
             # Trigger churn prevention only if satisfaction < 0 AND in churn window
-            if satisfaction < 0 and in_churn_window:
+            if (price > c_max or satisfaction < 0) and in_churn_window:
+                if thread:
+                    close_enterprise_thread(self.conn, thread[0], 'superseded_by_retention')
                 self._create_churn_prevention_thread(customer_id, ent)
                 continue
 
             # Check plan_change only if in churn window
-            if in_churn_window:
+            if in_churn_window and not thread and ent['billing_day_mod30'] == self.current_day % 30:
                 self._check_plan_change_opportunity(
                     customer_id, ent, quality, steepness_left, steepness_right,
                     c_max, config, q_max, q_min, weekly_usage_mult,
@@ -6740,23 +6682,6 @@ Guidelines:
         best_satisfaction = current_satisfaction
         best_quality = current_quality
 
-        # Pre-compute per-customer terms that don't change across plans
-        relationship = ent['relationship'] or 0.5
-        rel_bonus = self.config.relationship_quality_bonus_max * (relationship - 0.5) * 2
-        days_subscribed = self.current_day - ent['start_day'] if ent['start_day'] else 0
-        stickiness_bonus = self.config.stickiness_log_scale * math.log(1 + days_subscribed / 30) if days_subscribed > 0 else 0.0
-        issue_penalty = 0.03 * (ent['open_issue_days'] or 0)
-        ads_sensitivity = ent['ads_quality_sensitivity'] or 0.0
-        ads_penalty = 0.0
-        if ads_sensitivity > 0:
-            group_id = ent['group_id']
-            ads_global = self.config.ads_strength_global
-            ads_group = self.config.ads_strength_by_group.get(group_id, 0.0)
-            strength = min(max(ads_global + ads_group, 0.0), 1.0)
-            if strength > 0:
-                effective_ads = math.log(1.0 + 9.0 * strength) / math.log(10.0)
-                ads_penalty = ads_sensitivity * effective_ads
-
         for plan in ['A', 'B', 'C']:
             if plan == current_plan:
                 continue
@@ -6768,18 +6693,9 @@ Guidelines:
             if list_price > c_max:
                 continue
 
-            # Get perceived quality using ALL terms (matches daily satisfaction computation)
-            q_shared = self._cached_q_shared_per_plan.get(plan, 0.5)
-            # Add per-group quality bonus (from R&D investments) × tier multiplier
-            group_id_pc = ent['group_id']
-            if self._cached_q_group_bonus and group_id_pc in self._cached_q_group_bonus:
-                q_shared += self._cached_q_group_bonus[group_id_pc] * self._cached_tier_multiplier_per_plan.get(plan, 1.0)
-            daily_usage_rate_pc = ent['daily_usage_rate'] if ent['daily_usage_rate'] else 0.0
-            total_demand = daily_usage_rate_pc * weekly_usage_mult
-            plan_quota = config.get(f'quota_{plan}', 100) if config else 100
-            quota_factor = compute_quota_quality_factor(plan_quota, total_demand)
-            quality_before_incident_penalties = q_shared + rel_bonus + stickiness_bonus
-            quality = quality_before_incident_penalties * quota_factor - issue_penalty - ads_penalty
+            quality = self._compute_comprehensive_quality_inline(
+                ent, plan, config, self._today_overload, self._today_outage, weekly_usage_mult
+            )
             satisfaction = self._compute_satisfaction(steepness_left, steepness_right, c_max, quality, list_price, q_max, q_min)
 
             # Check participation constraint (satisfaction > 0 means acceptable)
@@ -7045,7 +6961,7 @@ Guidelines:
         subscribers = self.conn.execute("""
             SELECT s.subscription_id, s.customer_id, s.listed_price,
                    s.promotion, s.effective_price,
-                   s.plan, s.pending_plan, s.pending_price, s.start_day,
+                   s.plan, s.pending_plan, s.pending_price, s.start_day, s.billing_day_mod30,
                    c.customer_type, c.usage_scale, c.seat_count, c.group_id,
                    c.c_max,
                    cs.current_c_max,
@@ -7054,20 +6970,19 @@ Guidelines:
             JOIN customers c ON s.customer_id = c.customer_id
             JOIN customer_state cs ON c.customer_id = cs.customer_id
             WHERE s.status = 'subscribed' AND s.end_day IS NULL
-              AND s.billing_day_mod30 = ?
-        """, (billing_day,)).fetchall()
+              AND (s.billing_day_mod30 = ? OR (c.customer_type='large' AND s.start_day=?))
+        """, (billing_day, self.current_day)).fetchall()
 
         # L4: Collect batch operations
         pending_updates = []    # (plan, listed_price, promo, eff_price, eff_c_max, subscription_id) for pending plan changes
         ledger_inserts = []     # (day, category, amount, note)
         reset_updates = []      # (new_daily_usage_rate, subscription_id)
         promo_updates = []      # (promotion, effective_price, effective_c_max, first_billing_done, subscription_id)
-        price_updates = []      # (listed_price, subscription_id) for individual price changes
 
         # Payment suspension: enterprise customers with active churn_prevention
         # threads don't pay (satisfaction was < 0 at renewal time).
         # Payment resumes when customer accepts a deal (_finalize_deal closes thread).
-        payment_suspended = getattr(self, '_payment_suspended_customers', set())
+        payment_suspended = {cid for cid, (_, kind) in self._live_enterprise_threads().items() if kind == 'churn_prevention'}
 
         for sub in subscribers:
             # Skip billing for enterprise customers with suspended payment
@@ -7092,8 +7007,6 @@ Guidelines:
             group_id = sub['group_id'] or 'S1'
             first_billing_done = sub['first_billing_done'] or 0
 
-            # If the evaluated list price decreased, bill and persist the lower
-            # price. Otherwise preserve the subscription's stored price.
             evaluated_list_price = config.get(f'price_{current_plan}')
             if (
                 sub['customer_type'] == 'small'
@@ -7101,8 +7014,6 @@ Guidelines:
                 and evaluated_list_price is not None
             ):
                 billing_price = min(billing_price, evaluated_list_price)
-                if billing_price < sub['listed_price']:
-                    price_updates.append((billing_price, sub['subscription_id']))
 
             # Snapshot baseline budget. Satisfaction applies drift at read time;
             # storing a drifted budget here would add the same offset twice.
@@ -7111,7 +7022,10 @@ Guidelines:
             # Compute promotion for this billing period
             existing_promo = self._get_effective_promotion(customer_id, group_id, current_plan)
             # Lead promotion only applies if first billing hasn't been done yet
-            if not first_billing_done:
+            if sub['customer_type'] == 'large':
+                total_promo = 0.0
+                effective_price = billing_price
+            elif not first_billing_done:
                 # The subscription row snapshots the exact first-period
                 # promotion used at signup, including acquisition-channel
                 # targeting. Recomputing here would lose channel-specific lead
@@ -7129,6 +7043,9 @@ Guidelines:
                 effective_price = max(0.0, billing_price - total_promo)
 
             total_payment = effective_price * seat_count
+            if sub['customer_type'] == 'large' and sub['start_day'] == self.current_day:
+                days = (sub['billing_day_mod30'] - billing_day) % 30 or 30
+                total_payment *= days / 30
             payments += total_payment
             ledger_inserts.append((
                 self.current_day, 'subscription_payment', total_payment,
@@ -7142,7 +7059,7 @@ Guidelines:
 
             # Store promotion + effective_price + effective_c_max on subscription for satisfaction to read directly
             # After first billing, only existing user promotion applies (no more lead promo)
-            next_promo = self._get_effective_promotion(customer_id, group_id, current_plan)
+            next_promo = existing_promo if sub['customer_type'] == 'small' else 0.0
             next_eff_price = max(0.0, billing_price - next_promo)
             promo_updates.append((next_promo, next_eff_price, billing_c_max, 1, seat_count, sub['subscription_id']))
 
@@ -7174,13 +7091,6 @@ Guidelines:
                 SET daily_usage_rate = ?, billing_period_usage = 0
                 WHERE subscription_id = ?
             """, reset_updates)
-
-        if price_updates:
-            self.conn.executemany("""
-                UPDATE subscriptions
-                SET listed_price = ?
-                WHERE subscription_id = ?
-            """, price_updates)
 
         if promo_updates:
             self.conn.executemany("""
@@ -7414,7 +7324,7 @@ Guidelines:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, sat_snapshot_rows)
 
-    def step_week(self) -> DayResult:
+    def step_week(self, before_day=None) -> DayResult:
         """Simulate one week (7 days) and return accumulated results.
 
         Calls step_day() 7 times internally. Customer social media posts
@@ -7425,14 +7335,19 @@ Guidelines:
         import time as _time
         _week_start = _time.monotonic()
 
+        remaining = min(7, self.config.total_days - self.current_day)
+        if remaining <= 0 or self.shutdown_mode:
+            raise ValueError('Game has ended')
         accumulated = None
-        for i in range(7):
+        for i in range(remaining):
             # Stop early if bankrupt (shutdown_mode set by step_day when cash < 0)
             if self.shutdown_mode and accumulated is not None:
                 break
 
             # Suppress customer social posts for first 6 days of the week
-            self._suppress_customer_posts = (i < 6)
+            self._suppress_customer_posts = (i < remaining - 1)
+            if before_day is not None:
+                before_day(self.current_day + 1)
             day_result = self.step_day()
 
             if accumulated is None:
@@ -7503,6 +7418,8 @@ Guidelines:
 
     def step_day(self) -> DayResult:
         """Simulate one day and return results."""
+        if self.current_day >= self.config.total_days or self.shutdown_mode:
+            raise ValueError("Game has ended")
         import time as _time
         _step_start = _time.monotonic()
         _timings = {}
@@ -7550,6 +7467,9 @@ Guidelines:
         _t0 = _time.monotonic()
         total_usage, usage_per_plan = self._compute_usage(config)
         overload, outage, downtime, p95_ms, error_rate = self._compute_service_metrics(total_usage, config)
+        self._today_overload, self._today_outage = overload, outage
+        set_global_state(self.conn, 'overload_rate', overload)
+        set_global_state(self.conn, 'outage_active', int(outage))
         _timings['compute_usage+metrics'] = _time.monotonic() - _t0
 
         # Record service day
@@ -7628,6 +7548,7 @@ Guidelines:
 
         # Generate new customers (subscribe directly based on curve)
         _t0 = _time.monotonic()
+        self._cache_step_day_globals(config)
         gen_result = self._generate_new_customers(config)
         new_subscribers = gen_result['total_new']  # kept for backward compat
         new_leads = gen_result['total_leads']
@@ -7637,6 +7558,13 @@ Guidelines:
         _t0 = _time.monotonic()
         payments = self._process_billing(config)
         _timings['process_billing'] = _time.monotonic() - _t0
+
+        self.conn.execute("""
+            UPDATE issues SET status='resolved', resolved_day=?, resolution_type='subscription_ended'
+            WHERE status='open' AND customer_id IN (
+                SELECT customer_id FROM subscriptions WHERE status='cancelled'
+            )
+        """, (self.current_day,))
 
         # Process costs
         costs = self._process_costs(config, total_usage, usage_per_plan)

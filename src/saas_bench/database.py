@@ -221,14 +221,14 @@ TABLE_DOCS = {
         }
     },
     'research_projects': {
-        'description': 'R&D research tier invocations (in-progress, completed). 20 independent tiers, repeatable — same tier can be started multiple times. Tiers 1-10: standard R&D. Tiers 11-20: frontier moonshots (higher cost, longer timelines, more variance, better quality/$).',
+        'description': 'R&D research tier invocations (in-progress, completed). 10 independent, repeatable tiers. In-progress projects show tier forecasts, not realized outcomes.',
         'columns': {
             'project_id': 'TEXT PRIMARY KEY — Unique invocation ID (e.g., "t1_1", "t1_2", "t3_1")',
-            'tier': 'INTEGER — Tier number (1-20)',
+            'tier': 'INTEGER — Tier number (1-10)',
             'status': "TEXT — 'in_progress', 'completed'",
             'started_day': 'INTEGER — Day this invocation was started',
-            'expected_completion_day': 'INTEGER — Expected completion day (sampled from Normal distribution)',
-            'expected_quality_boost': 'REAL — Sampled quality boost to be applied on completion',
+            'expected_completion_day': 'INTEGER — Forecast completion day (tier mean)',
+            'expected_quality_boost': 'REAL — Forecast quality boost (tier mean)',
             'quality_boost_applied': 'REAL — Actual quality boost applied on completion',
         },
         'internal_columns': {
@@ -753,7 +753,7 @@ def init_database(db_path: Path, *, connection=None) -> sqlite3.Connection:
         -- R&D Research Tiers (20 independent, repeatable tiers)
         CREATE TABLE IF NOT EXISTS research_projects (
             project_id TEXT PRIMARY KEY,          -- Unique invocation ID (e.g., "t1_1", "t3_2")
-            tier INTEGER NOT NULL,                -- Tier number (1-20)
+            tier INTEGER NOT NULL,                -- Tier number (1-10)
             status TEXT DEFAULT 'in_progress',    -- 'in_progress', 'completed'
             started_day INTEGER,
             expected_completion_day INTEGER,
@@ -762,6 +762,12 @@ def init_database(db_path: Path, *, connection=None) -> sqlite3.Connection:
             quality_boost_applied REAL DEFAULT 0,
             current_decay_reduction REAL DEFAULT 0,        -- DEPRECATED: kept for backward compat
             decay_reduction_expiry_day INTEGER              -- DEPRECATED: kept for backward compat
+        );
+
+        CREATE TABLE IF NOT EXISTS _hidden_research_outcomes (
+            project_id TEXT PRIMARY KEY,
+            completion_day INTEGER NOT NULL,
+            quality_boost REAL NOT NULL
         );
 
         -- Competitor Events: periodic competitor launches that raise user expectations
@@ -2105,11 +2111,11 @@ def mark_enterprise_thread_dead(conn: sqlite3.Connection, thread_id: int, status
     simply becomes invisible to internal queries without the agent seeing any change.
     """
     conn.execute("""
-        UPDATE enterprise_turns SET _internal_status = ?
+        UPDATE enterprise_turns SET closed = 1, close_reason = ?, _internal_status = ?
         WHERE thread_id = ? AND message_id = (
             SELECT MAX(message_id) FROM enterprise_turns WHERE thread_id = ?
         )
-    """, (status, thread_id, thread_id))
+    """, (status, status, thread_id, thread_id))
 
 
 def update_enterprise_turn_next_reply(conn: sqlite3.Connection, thread_id: int,

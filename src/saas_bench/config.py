@@ -807,7 +807,7 @@ class BenchmarkConfig:
     # Reality-matched: Customer success investment drives 20-40% retention improvement
     # [Gainsight 2024: Companies with CS teams see 25% lower churn]
     # [Totango 2024: Fast support response correlates with 30% higher NPS]
-    relationship_quality_bonus_max: float = 0.45  # Max quality bonus from perfect relationship
+    relationship_quality_bonus_max: float = 0.15  # Max quality bonus from perfect relationship
     relationship_response_time_factor: float = 0.02  # Relationship change per day of delayed response
     relationship_neutral_point: float = 0.5  # Relationship value that gives zero bonus
     relationship_scale: float = 2.0  # Multiplier in bonus formula: bonus_max * (rel - neutral) * scale
@@ -836,8 +836,8 @@ class BenchmarkConfig:
     individual_ops_scale: float = 0.6  # issues resolved per $ ops spend per day for S* + D_S* groups
     enterprise_ops_scale: float = 0.1  # issues resolved per $ ops spend per day for E* + D_E* groups (lower than individual)
     quick_resolution_threshold_days: int = 2  # Max days for "quick" resolution bonus
-    quick_resolution_boost_1day: float = 0.40  # Relationship boost for 1-day resolution
-    quick_resolution_boost_2day: float = 0.30  # Relationship boost for 2-day resolution
+    quick_resolution_boost_1day: float = 0.04  # Relationship boost for 1-day resolution
+    quick_resolution_boost_2day: float = 0.03  # Relationship boost for 2-day resolution
     relationship_decay_per_unresolved_day: float = 0.01  # Relationship loss per unresolved issue day
 
     # === REPUTATION LEAD MULTIPLIER ===
@@ -1317,68 +1317,35 @@ RESEARCH_TIERS: List[ResearchTier] = [
     # Quality: non-linear growth, ~50% CV (high risk/reward)
     ResearchTier(tier=1,  name="Prompt Engineering Optimization",
                  description="Systematic prompt tuning and output consistency improvements",
-                 cost=166_667,   mean_days=12,  std_days=12,  mean_quality_boost=0.04,  std_quality_boost=0.020),
+                 cost=166_667,   mean_days=12, std_days=5,  mean_quality_boost=0.04,  std_quality_boost=0.020),
     ResearchTier(tier=2,  name="Evaluation & Testing Pipeline",
                  description="Automated quality evaluation, regression testing, and A/B experimentation",
-                 cost=333_333,   mean_days=17,  std_days=20,  mean_quality_boost=0.07,  std_quality_boost=0.035),
+                 cost=333_333,   mean_days=17, std_days=8,  mean_quality_boost=0.07,  std_quality_boost=0.035),
     ResearchTier(tier=3,  name="Caching & Latency Optimization",
                  description="Smart caching layer, response latency improvements, and query optimization",
-                 cost=500_000,   mean_days=23,  std_days=30,  mean_quality_boost=0.11,  std_quality_boost=0.055),
+                 cost=500_000,   mean_days=23, std_days=10,  mean_quality_boost=0.11,  std_quality_boost=0.055),
     ResearchTier(tier=4,  name="Fine-Tuning Infrastructure",
                  description="Custom fine-tuning pipeline for domain-specific model improvements",
-                 cost=666_667,   mean_days=32,  std_days=42,  mean_quality_boost=0.16,  std_quality_boost=0.080),
+                 cost=666_667,   mean_days=32, std_days=14,  mean_quality_boost=0.16,  std_quality_boost=0.080),
     ResearchTier(tier=5,  name="RAG & Knowledge Integration",
                  description="Retrieval-augmented generation with re-ranking and knowledge graph integration",
-                 cost=833_333,   mean_days=42,  std_days=58,  mean_quality_boost=0.22,  std_quality_boost=0.110),
+                 cost=833_333,   mean_days=42, std_days=19,  mean_quality_boost=0.22,  std_quality_boost=0.110),
     ResearchTier(tier=6,  name="Multi-Modal Support",
                  description="Image, document, and structured data understanding capabilities",
-                 cost=1_000_000,   mean_days=53,  std_days=75,  mean_quality_boost=0.30,  std_quality_boost=0.150),
+                 cost=1_000_000,   mean_days=53, std_days=24,  mean_quality_boost=0.30,  std_quality_boost=0.150),
     ResearchTier(tier=7,  name="Agentic Capabilities",
                  description="Multi-step reasoning, tool use, and autonomous task completion",
-                 cost=1_166_667,   mean_days=67,  std_days=95,  mean_quality_boost=0.40,  std_quality_boost=0.200),
+                 cost=1_166_667,   mean_days=67, std_days=30,  mean_quality_boost=0.40,  std_quality_boost=0.200),
     ResearchTier(tier=8,  name="RLHF & Alignment",
                  description="Reinforcement learning from human feedback for preference alignment",
-                 cost=1_333_333, mean_days=83,  std_days=120, mean_quality_boost=0.52,  std_quality_boost=0.260),
+                 cost=1_333_333, mean_days=83, std_days=37, mean_quality_boost=0.52,  std_quality_boost=0.260),
     ResearchTier(tier=9,  name="Next-Gen Architecture",
                  description="Major model architecture upgrade for step-change quality improvement",
-                 cost=1_500_000, mean_days=103, std_days=150, mean_quality_boost=0.67,  std_quality_boost=0.335),
+                 cost=1_500_000, mean_days=103, std_days=46, mean_quality_boost=0.67,  std_quality_boost=0.335),
     ResearchTier(tier=10, name="Self-Evolving Model Ecosystem",
                  description="Orchestrated system of specialized models that self-optimize and continuously improve",
-                 cost=1_666_667, mean_days=127, std_days=185, mean_quality_boost=0.85, std_quality_boost=0.425),
+                 cost=1_666_667, mean_days=127, std_days=57, mean_quality_boost=0.85, std_quality_boost=0.425),
 
-    # --- Frontier Tiers (11-20) ---
-    # Cost: 2/3 of v3.2w values. Long timelines, very high variance.
-    # Quality: large boosts (1.1 to 8.0 mean), very high variance (~55-75% CV)
-    ResearchTier(tier=11, name="Synthetic Data Engine",
-                 description="Large-scale synthetic data generation and curriculum learning pipeline for domain coverage",
-                 cost=2_500_000,   mean_days=140,  std_days=230,  mean_quality_boost=1.10,  std_quality_boost=0.660),
-    ResearchTier(tier=12, name="Distributed Training Cluster",
-                 description="Multi-node distributed training infrastructure for full model retraining at scale",
-                 cost=3_666_667,   mean_days=160,  std_days=290,  mean_quality_boost=1.40,  std_quality_boost=0.840),
-    ResearchTier(tier=13, name="Constitutional AI Framework",
-                 description="Advanced safety and alignment framework with self-critique and reward model ensemble",
-                 cost=5_000_000,   mean_days=183,  std_days=360,  mean_quality_boost=1.75,  std_quality_boost=1.050),
-    ResearchTier(tier=14, name="Mixture of Experts Overhaul",
-                 description="Sparse mixture-of-experts architecture with dynamic routing and expert specialization",
-                 cost=6_666_667,   mean_days=210,  std_days=440,  mean_quality_boost=2.15,  std_quality_boost=1.400),
-    ResearchTier(tier=15, name="World Model & Reasoning Core",
-                 description="Internal world model for causal reasoning, planning, and counterfactual simulation",
-                 cost=9_166_667,   mean_days=240,  std_days=540,  mean_quality_boost=2.70,  std_quality_boost=1.890),
-    ResearchTier(tier=16, name="Autonomous Research Agent",
-                 description="Self-directed research loop that identifies weaknesses and designs targeted training runs",
-                 cost=11_666_667,   mean_days=273,  std_days=620,  mean_quality_boost=3.40,  std_quality_boost=2.380),
-    ResearchTier(tier=17, name="Neural Architecture Search",
-                 description="Automated architecture discovery using evolutionary search over billion-parameter design space",
-                 cost=15_000_000,  mean_days=317,  std_days=720,  mean_quality_boost=4.20,  std_quality_boost=3.150),
-    ResearchTier(tier=18, name="Foundation Model Distillation",
-                 description="Multi-teacher distillation from frontier models into a compact, specialized powerhouse",
-                 cost=18_333_333,  mean_days=360,  std_days=830,  mean_quality_boost=5.20,  std_quality_boost=3.900),
-    ResearchTier(tier=19, name="Recursive Self-Improvement",
-                 description="Model that iteratively improves its own training process and data selection strategy",
-                 cost=21_666_667,  mean_days=417,  std_days=1000, mean_quality_boost=6.50,  std_quality_boost=5.200),
-    ResearchTier(tier=20, name="Artificial General Reasoning",
-                 description="Moonshot program for general-purpose reasoning across all domains with emergent capabilities",
-                 cost=25_000_000,  mean_days=467,  std_days=1120, mean_quality_boost=8.00,  std_quality_boost=6.400),
 ]
 
 RESEARCH_TIERS_BY_ID: Dict[int, ResearchTier] = {rt.tier: rt for rt in RESEARCH_TIERS}

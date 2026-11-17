@@ -15,7 +15,7 @@ from pathlib import Path
 # Version 2 requires immutable customer baselines and consistent effective
 # renewal prices. Version-1 state may contain already-shifted latent baselines;
 # there is no lossless migration, so never resume it under the new semantics.
-VERSION = 2
+VERSION = 3
 
 
 class IncompatibleCheckpointError(RuntimeError):

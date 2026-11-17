@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Any
 from pathlib import Path
@@ -40,6 +41,10 @@ from ._sql_chunk import chunked_select, chunked_execute
 # =====================================================================
 # Helper: render table doc from TABLE_DOCS (for sample_io generation)
 # =====================================================================
+def _valid_amount(value):
+    return type(value) in (int, float) and 0 <= value <= 10**12
+
+
 def _render_table_doc(table_name: str, max_cols: int | None = None) -> str:
     """Render a table's describe_tables output from TABLE_DOCS.
 
@@ -608,7 +613,7 @@ TOOL_DOCS = {
                 "social_media_posts": "Customer social media posts. Sentiment is HIDDEN \u2014 must infer from content.",
                 "enterprise_turns": "Enterprise customer negotiation turns. Each row is one turn in a conversation thread.",
                 "notifications": "Agent inbox \u2014 simple string notifications. Columns: notification_id, day, type, message.",
-                "research_projects": "R&D research tiers (20 independent tiers, available/in-progress/completed).",
+                "research_projects": "R&D research tiers (10 independent tiers, available/in-progress/completed).",
                 "ad_channel_leads": "Advertising channel effectiveness history.",
                 "group_info_levels": "Customer group discovery and research levels.",
                 "issues": "Individual customer support issues with lifecycle tracking. Columns: issue_id, customer_id, group_id, open_day, days_open, status ('open'/'resolved'), resolved_day, resolution_type. Query to analyze issue patterns by group, resolution speed, and operational effectiveness."
@@ -1348,37 +1353,37 @@ TOOL_DOCS = {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tier": {"type": "integer", "description": "Tier number to start (1-20)"}
+                "tier": {"type": "integer", "description": "Tier number to start (1-10)"}
             },
             "required": ["tier"]
         },
         "parameters": {
             "tier": {
                 "type": "integer",
-                "description": "The research tier to start (1-20). Use list_research_projects() to see all tiers and their status."
+                "description": "The research tier to start (1-10). Use list_research_projects() to see all tiers and their status."
             }
         },
         "returns": {
-            "success": "Tier details including cost, sampled duration, sampled quality boost, invocation ID.",
+            "success": "Tier details including cost, forecast duration, forecast quality boost, invocation ID.",
             "error_not_found": "Unknown tier number",
             "error_in_progress": "Tier already has an in-progress invocation (wait for completion)",
             "error_funds": "Insufficient cash for tier cost"
         },
         "mechanics": {
-            "cost": "One-time cost deducted immediately. Tiers 1-10: $250K to $2.5M. Tiers 11-20: $3.75M to $37.5M.",
-            "duration": "Sampled from Normal(mean_days, std_days), minimum 30 days. Tiers 1-10: 35d-380d mean (~40-50% CV). Tiers 11-20: 420d-1400d mean (~55-80% CV).",
-            "quality_boost": "Sampled from Normal(mean_quality, std_quality), minimum 0.001. Tiers 1-10: +0.04 to +0.85 mean (~50% CV). Tiers 11-20: +1.1 to +8.0 mean (~55-80% CV). Frontier tiers are cheaper per quality point but much riskier.",
+            "cost": "One-time charge of $166,667 to $1,666,667, depending on tier.",
+            "duration": "Private draw with mean 12 to 127 days, about 45% CV, minimum one day.",
+            "quality_boost": "Private draw with mean +0.04 to +0.85, 50% CV, minimum 0.001.",
             "repeatability": "Same tier can be started multiple times. Each invocation gets independent samples. Only one invocation per tier can be in-progress at a time.",
-            "independence": "20 independent tiers — no dependencies. Any tier can be started at any time."
+            "independence": "10 independent tiers — no dependencies. Any tier can be started at any time."
         },
         "output_schema": {
             "project_id": "str — invocation ID (e.g., 't3_1')",
             "tier": "int — tier number",
             "name": "str — research project name",
             "cost": "float — cost deducted",
-            "expected_completion_day": "int — sim day when project completes",
+            "expected_completion_day": "int — forecast completion day",
             "expected_duration_days": "int — days until completion",
-            "expected_quality_boost": "float — sampled quality boost",
+            "expected_quality_boost": "float — forecast quality boost",
             "_access": "result['expected_completion_day'] → when to expect completion"
         },
         "impact": "Cash reduced by tier cost. Quality improves permanently when project completes. R&D gives quality jumps that dev spending alone cannot match.",
@@ -1388,8 +1393,8 @@ TOOL_DOCS = {
         },
         "sample_io": {
             "success": [
-                {"label": "Start tier 1", "input": {"tier": 1}, "output": "=== R&D Tier Started ===\nTier 1: Prompt Engineering Optimization (invocation t1_1)\nCost: $100,000 (deducted)\nExpected completion: ~day 42 (42 days)\nExpected quality boost: +0.048\nDescription: Systematic prompt tuning and output consistency improvements"},
-                {"label": "Repeat tier 1", "input": {"tier": 1}, "output": "=== R&D Tier Started ===\nTier 1: Prompt Engineering Optimization (invocation t1_2)\nCost: $100,000 (deducted)\nExpected completion: ~day 185 (33 days)\nExpected quality boost: +0.029\nDescription: Systematic prompt tuning and output consistency improvements"}
+                {"label": "Start tier 1", "input": {"tier": 1}, "output": "=== R&D Tier Started ===\nTier 1: Prompt Engineering Optimization (invocation t1_1)\nCost: $166,667 (deducted)\nExpected completion: ~day 12 (12 days)\nExpected quality boost: +0.040\nDescription: Systematic prompt tuning and output consistency improvements"},
+                {"label": "Repeat tier 1", "input": {"tier": 1}, "output": "=== R&D Tier Started ===\nTier 1: Prompt Engineering Optimization (invocation t1_2)\nCost: $166,667 (deducted)\nExpected completion: ~day 164 (12 days)\nExpected quality boost: +0.040\nDescription: Systematic prompt tuning and output consistency improvements"}
             ],
             "failure": [
                 {"label": "Already in progress", "input": {"tier": 1}, "output": "Tier 1 ('Prompt Engineering Optimization') already has an in-progress invocation. Wait for it to complete before starting another."},
@@ -1414,7 +1419,7 @@ TOOL_DOCS = {
             "tiers": "List[Dict] — each tier: tier (int), name (str), cost (float), mean_days (int), mean_quality_boost (float), in_progress (int), completed (int), total_quality_boost (float)",
             "_access": "for t in result['tiers']: print(t['tier'], t['name'], t['cost'])"
         },
-        "total_tiers": 20,
+        "total_tiers": 10,
         "impact": "Read-only. No cost. Use to plan R&D investments.",
         "example_call": {
             "tool": "list_research_projects",
@@ -1914,7 +1919,7 @@ class AgentTools:
             return ToolResult(False, f"Invalid plan keys: {invalid}. Valid: {valid_keys}")
 
         for plan, val in prices.items():
-            if val is None or val <= 0:
+            if not _valid_amount(val) or val == 0:
                 return ToolResult(False, f"Price for plan {plan} must be positive")
 
         # Get current config and update
@@ -2038,7 +2043,7 @@ class AgentTools:
             return ToolResult(False, f"Invalid spend categories: {invalid}. Valid: {valid_keys}")
 
         for category, val in spend.items():
-            if val is None or val < 0:
+            if not _valid_amount(val):
                 return ToolResult(False, f"Spend for {category} cannot be negative")
 
         # Get current config and update
@@ -2136,7 +2141,7 @@ class AgentTools:
                     f"Valid groups: {sorted(valid_groups)}"
                 )
             for group_id, amount in groups.items():
-                if not isinstance(amount, (int, float)) or amount < 0:
+                if not _valid_amount(amount):
                     return ToolResult(False, f"Amount for ({channel_id}, {group_id}) must be a non-negative number")
 
         # Store in config
@@ -2202,16 +2207,6 @@ class AgentTools:
             by_group_plan: {group_id: {plan: $/day}}. Intersection of group + plan.
             by_customer: {customer_id_str: $/day}. Single-customer boost (like promotion).
         """
-        import math
-
-        def valid_amount(amount):
-            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-                return False
-            try:
-                return math.isfinite(amount) and amount >= 0
-            except OverflowError:
-                return False
-
         # Validate into local values before updating any scope. A bad later
         # scope must not partially apply an otherwise rejected request.
         g = self.config.targeted_ops_spend
@@ -2236,7 +2231,7 @@ class AgentTools:
             if invalid:
                 return ToolResult(False, f"Invalid group IDs: {invalid}. Valid: {sorted(valid_groups)}")
             for gid, amt in by_group.items():
-                if not valid_amount(amt):
+                if not _valid_amount(amt):
                     return ToolResult(False, f"Amount for {gid} must be a finite non-negative number")
             g = {k: float(v) for k, v in by_group.items()}
 
@@ -2248,7 +2243,7 @@ class AgentTools:
             if invalid_plans:
                 return ToolResult(False, f"Invalid plans: {invalid_plans}. Valid: {sorted(valid_plans)}")
             for plan, amt in by_plan.items():
-                if not valid_amount(amt):
+                if not _valid_amount(amt):
                     return ToolResult(False, f"Amount for plan {plan} must be a finite non-negative number")
             p = {k: float(v) for k, v in by_plan.items()}
 
@@ -2268,7 +2263,7 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plans for group {gid}: {bad_plans}. Valid: {sorted(valid_plans)}")
                 inner: Dict[str, float] = {}
                 for plan, amt in plans_dict.items():
-                    if not valid_amount(amt):
+                    if not _valid_amount(amt):
                         return ToolResult(False, f"Amount for {gid}/{plan} must be a finite non-negative number")
                     inner[plan] = float(amt)
                 parsed_gp[gid] = inner
@@ -2288,7 +2283,7 @@ class AgentTools:
                         raise ValueError
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be a positive integer")
-                if not valid_amount(amt):
+                if not _valid_amount(amt):
                     return ToolResult(False, f"Amount for customer {k} must be a finite non-negative number")
                 parsed_c[cid] = float(amt)
             c = parsed_c
@@ -2368,10 +2363,10 @@ class AgentTools:
                 f"Valid groups: {sorted(valid_groups)}"
             )
         for group_id, amount in targeted_spend.items():
-            if not isinstance(amount, (int, float)) or amount < 0:
+            if not _valid_amount(amount):
                 return ToolResult(False, f"Amount for {group_id} must be a non-negative number")
 
-        self.config.targeted_dev_spend = targeted_spend
+        self.config.targeted_dev_spend = dict(targeted_spend)
 
         total_extra = sum(targeted_spend.values())
         summary_parts = [f"  • {gid}: +${amt:.0f}/day" for gid, amt in targeted_spend.items()]
@@ -2401,13 +2396,14 @@ class AgentTools:
             by_group: {group_id: strength}. None = no change.
             by_customer: {customer_id_str: strength}. None = no change.
         """
+        changes = {}
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
 
         # Validate and apply global strength
         if global_strength is not None:
-            if not isinstance(global_strength, (int, float)) or global_strength < 0 or global_strength > 1:
+            if not _valid_amount(global_strength) or global_strength > 1:
                 return ToolResult(False, "Global ads strength must be between 0.0 and 1.0")
-            self.config.ads_strength_global = float(global_strength)
+            changes["ads_strength_global"] = float(global_strength)
 
         # Validate and apply per-group strength
         if by_group is not None:
@@ -2417,9 +2413,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0 or val > 1:
+                if not _valid_amount(val) or val > 1:
                     return ToolResult(False, f"Strength for {gid} must be between 0.0 and 1.0")
-            self.config.ads_strength_by_group = {k: float(v) for k, v in by_group.items()}
+            changes["ads_strength_by_group"] = {k: float(v) for k, v in by_group.items()}
 
         # Validate and apply per-customer strength
         if by_customer is not None:
@@ -2431,12 +2427,14 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0 or v > 1:
+                if not _valid_amount(v) or v > 1:
                     return ToolResult(False, f"Strength for customer {k} must be between 0.0 and 1.0")
                 parsed[cid] = float(v)
-            self.config.ads_strength_by_customer = parsed
+            changes["ads_strength_by_customer"] = parsed
 
         # Build summary
+        for name, value in changes.items():
+            setattr(self.config, name, value)
         parts = [f"Global: {self.config.ads_strength_global:.2f}"]
         if self.config.ads_strength_by_group:
             parts.append(f"Groups: {{{', '.join(f'{k}: {v:.2f}' for k, v in self.config.ads_strength_by_group.items())}}}")
@@ -2464,13 +2462,14 @@ class AgentTools:
             by_channel: {channel_id: $/month}. None = no change.
             by_channel_group: {channel_id: {group_id: $/month}}. None = no change.
         """
+        changes = {}
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_channels = set(AD_CHANNELS.keys())
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if not _valid_amount(global_promotion):
                 return ToolResult(False, "Global lead promotion must be non-negative")
-            self.config.lead_promotion_global = float(global_promotion)
+            changes["lead_promotion_global"] = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2479,9 +2478,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if not _valid_amount(val):
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.lead_promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            changes["lead_promotion_by_group"] = {k: float(v) for k, v in by_group.items()}
 
         if by_channel is not None:
             if not isinstance(by_channel, dict):
@@ -2490,9 +2489,9 @@ class AgentTools:
             if invalid_channels_found:
                 return ToolResult(False, f"Invalid channels: {invalid_channels_found}. Valid: {sorted(valid_channels)}")
             for ch_id, val in by_channel.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if not _valid_amount(val):
                     return ToolResult(False, f"Promotion for channel '{ch_id}' must be non-negative")
-            self.config.lead_promotion_by_channel = {k: float(v) for k, v in by_channel.items()}
+            changes["lead_promotion_by_channel"] = {k: float(v) for k, v in by_channel.items()}
 
         if by_channel_group is not None:
             if not isinstance(by_channel_group, dict):
@@ -2508,11 +2507,13 @@ class AgentTools:
                 if invalid_groups:
                     return ToolResult(False, f"Invalid group IDs for channel '{ch_id}': {invalid_groups}. Valid: {sorted(valid_groups)}")
                 for gid, val in group_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if not _valid_amount(val):
                         return ToolResult(False, f"Promotion for channel '{ch_id}', group '{gid}' must be non-negative")
                 parsed[ch_id] = {k: float(v) for k, v in group_dict.items()}
-            self.config.lead_promotion_by_channel_group = parsed
+            changes["lead_promotion_by_channel_group"] = parsed
 
+        for name, value in changes.items():
+            setattr(self.config, name, value)
         parts = [f"Global: ${self.config.lead_promotion_global:.2f}/mo"]
         if self.config.lead_promotion_by_group:
             parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.lead_promotion_by_group.items())}}}")
@@ -2549,13 +2550,14 @@ class AgentTools:
             by_customer: {customer_id_str: $/month}. None = no change.
             by_group_plan: {group_id: {plan: $/month}}. None = no change.
         """
+        changes = {}
         valid_groups = set(INITIAL_CUSTOMER_GROUPS.keys()) | set(get_discovered_groups(self.conn))
         valid_plans = {'A', 'B', 'C'}
 
         if global_promotion is not None:
-            if not isinstance(global_promotion, (int, float)) or global_promotion < 0:
+            if not _valid_amount(global_promotion):
                 return ToolResult(False, "Global promotion must be non-negative")
-            self.config.promotion_global = float(global_promotion)
+            changes["promotion_global"] = float(global_promotion)
 
         if by_group is not None:
             if not isinstance(by_group, dict):
@@ -2564,9 +2566,9 @@ class AgentTools:
             if invalid_groups:
                 return ToolResult(False, f"Invalid group IDs: {invalid_groups}. Valid: {sorted(valid_groups)}")
             for gid, val in by_group.items():
-                if not isinstance(val, (int, float)) or val < 0:
+                if not _valid_amount(val):
                     return ToolResult(False, f"Promotion for {gid} must be non-negative")
-            self.config.promotion_by_group = {k: float(v) for k, v in by_group.items()}
+            changes["promotion_by_group"] = {k: float(v) for k, v in by_group.items()}
 
         if by_customer is not None:
             if not isinstance(by_customer, dict):
@@ -2577,10 +2579,10 @@ class AgentTools:
                     cid = int(k)
                 except (ValueError, TypeError):
                     return ToolResult(False, f"Customer ID '{k}' must be an integer")
-                if not isinstance(v, (int, float)) or v < 0:
+                if not _valid_amount(v):
                     return ToolResult(False, f"Promotion for customer {k} must be non-negative")
                 parsed[cid] = float(v)
-            self.config.promotion_by_customer = parsed
+            changes["promotion_by_customer"] = parsed
 
         if by_group_plan is not None:
             if not isinstance(by_group_plan, dict):
@@ -2597,12 +2599,14 @@ class AgentTools:
                     return ToolResult(False, f"Invalid plan keys for group {gid}: {invalid_plans}. Valid: {sorted(valid_plans)}")
                 parsed_inner = {}
                 for plan, val in plans_dict.items():
-                    if not isinstance(val, (int, float)) or val < 0:
+                    if not _valid_amount(val):
                         return ToolResult(False, f"Promotion for {gid}/{plan} must be non-negative")
                     parsed_inner[plan] = float(val)
                 parsed_gp[gid] = parsed_inner
-            self.config.promotion_by_group_plan = parsed_gp
+            changes["promotion_by_group_plan"] = parsed_gp
 
+        for name, value in changes.items():
+            setattr(self.config, name, value)
         parts = [f"Global: ${self.config.promotion_global:.2f}/mo"]
         if self.config.promotion_by_group:
             parts.append(f"Groups: {{{', '.join(f'{k}: ${v:.2f}' for k, v in self.config.promotion_by_group.items())}}}")
@@ -2677,7 +2681,7 @@ class AgentTools:
     def set_usage_quotas(self, quotas: Dict[str, int]) -> ToolResult:
         """Set daily usage quotas (rate limits) for plans A, B, C.
 
-        Each customer on a plan can use up to this many units per day.
+        Each seat on a plan can use up to this many units per day.
         Exceeding quota degrades their experience.
 
         Args:
@@ -2687,7 +2691,7 @@ class AgentTools:
         for plan in ['A', 'B', 'C']:
             if plan not in quotas:
                 return ToolResult(False, f"Missing quota for plan {plan}")
-            if quotas[plan] < 0:
+            if not _valid_amount(quotas[plan]) or int(quotas[plan]) != quotas[plan]:
                 return ToolResult(False, f"Quota for plan {plan} cannot be negative")
 
         # Get current config and update
@@ -2765,8 +2769,12 @@ class AgentTools:
                 results.append({'error': 'missing customer_id'})
                 continue
 
-            customer_id = int(customer_id)
-
+            try:
+                customer_id = int(customer_id)
+                if not 0 < customer_id < 2**63:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                return ToolResult(False, 'Invalid customer ID')
             deal_offerings = []
             if not raw_offerings or not isinstance(raw_offerings, list):
                 summaries.append(f"Customer #{customer_id}: offerings required")
@@ -2783,7 +2791,7 @@ class AgentTools:
                         break
                     deal_offerings.append({
                         'plan': str(off[0]),
-                        'price_per_seat': float(off[1]),
+                        'price_per_seat': off[1],
                         'contract_months': 1,  # All contracts are 1 month (agent cannot set duration)
                     })
                 elif isinstance(off, dict):
@@ -2792,6 +2800,7 @@ class AgentTools:
                         results.append({'customer_id': customer_id, 'error': f'offering {i} missing price'})
                         valid = False
                         break
+                    off = dict(off)
                     off['contract_months'] = 1  # All contracts are 1 month (agent cannot set duration)
                     deal_offerings.append(off)
                 else:
@@ -2802,8 +2811,16 @@ class AgentTools:
             if not valid:
                 continue
 
+            for offering in deal_offerings:
+                price = offering.get('price_per_seat', offering.get('price'))
+                if not _valid_amount(price) or offering.get('plan') not in ('A', 'B', 'C'):
+                    return ToolResult(False, 'Invalid plan or offer price')
+                offering.pop('price', None)
+                offering['price_per_seat'] = price
             parsed_deals.append((customer_id, deal_offerings[:max_offerings]))
 
+        if results or len({cid for cid, _ in parsed_deals}) != len(parsed_deals):
+            return ToolResult(False, 'Invalid or duplicate deal')
         if not parsed_deals:
             # All deals failed parsing
             sent = 0
@@ -2864,6 +2881,14 @@ class AgentTools:
             """, cids_no_thread)
             for row in rows:
                 customer_info[row['customer_id']] = row
+
+        for cid in all_cids:
+            thread = active_threads.get(cid)
+            customer = customer_info.get(cid)
+            if thread and thread['last_sender'] == 'agent':
+                return ToolResult(False, f"Customer #{cid}: awaiting customer reply")
+            if not thread and (not customer or customer['customer_type'] != 'large' or customer['status'] != 'subscribed'):
+                return ToolResult(False, f"Customer #{cid}: no active enterprise subscription or lead")
 
         # --- Phase 3: Process deals using pre-fetched data (minimal per-deal SQL) ---
         threads_to_schedule = []  # (thread_id,) for schedule_customer_reply at end
@@ -4077,8 +4102,8 @@ os.chdir('{self.workspace_path}')
                 customer_id = deal[0] if deal else None
             elif isinstance(deal, dict):
                 customer_id = deal.get('customer_id')
-            elif isinstance(deal, (int, float)):
-                customer_id = int(deal)
+            elif type(deal) is int:
+                customer_id = deal
             else:
                 summaries.append(f"Error: invalid deal format: {deal}")
                 results.append({'error': 'invalid format'})
@@ -4089,8 +4114,16 @@ os.chdir('{self.workspace_path}')
                 results.append({'error': 'missing customer_id'})
                 continue
 
-            parsed_cids.append(int(customer_id))
+            try:
+                customer_id = int(customer_id)
+                if not 0 < customer_id < 2**63:
+                    raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                return ToolResult(False, 'Invalid customer ID')
+            parsed_cids.append(customer_id)
 
+        if results or len(set(parsed_cids)) != len(parsed_cids):
+            return ToolResult(False, 'Invalid or duplicate customer')
         if not parsed_cids:
             if len(deals) == 1 and results:
                 return ToolResult(False, summaries[0], {'results': results})
@@ -4100,7 +4133,7 @@ os.chdir('{self.workspace_path}')
         active_threads = {}  # customer_id -> {thread_id, thread_type, turn_number, current_offer_price, closed}
         rows = chunked_select(self.conn, """
             SELECT et.customer_id, et.thread_id, et.thread_type,
-                   et.turn_number, et.current_offer_price, et.closed, et.close_reason
+                   et.turn_number, et.current_offer_price, et.closed, et.close_reason, et.sender
             FROM enterprise_turns et
             WHERE et.customer_id IN ({ph})
               AND et.message_id = (
@@ -4115,18 +4148,19 @@ os.chdir('{self.workspace_path}')
                 'thread_type': row['thread_type'],
                 'turn_number': row['turn_number'],
                 'current_offer_price': row['current_offer_price'],
+                'last_sender': row['sender'],
             }
 
         # --- Phase 3: Process rejections using pre-fetched data ---
         new_lead_lost_cids = []  # customer_ids to mark subscriptions as lost
 
         for customer_id in parsed_cids:
-            at = active_threads.get(customer_id)
-            if not at:
-                summaries.append(f"Customer #{customer_id}: no active thread")
-                results.append({'customer_id': customer_id, 'error': 'no active thread'})
-                continue
+            thread = active_threads.get(customer_id)
+            if not thread or thread['last_sender'] == 'agent':
+                return ToolResult(False, f"Customer #{customer_id}: no thread awaiting your reply")
 
+        for customer_id in parsed_cids:
+            at = active_threads.get(customer_id)
             tid = at['thread_id']
 
             # Inline add_enterprise_turn with closed=1 (avoids extra SELECT)
@@ -4142,6 +4176,11 @@ os.chdir('{self.workspace_path}')
 
             if at['thread_type'] == 'new_lead':
                 new_lead_lost_cids.append(customer_id)
+            elif at['thread_type'] in ('churn_prevention', 'renewal'):
+                self.conn.execute("""
+                    UPDATE subscriptions SET status='cancelled', end_day=?, churn_reason=?
+                    WHERE customer_id=? AND status='subscribed' AND end_day IS NULL
+                """, (self.current_day, 'retention_declined', customer_id))
 
             summaries.append(f"Customer #{customer_id}: rejected ({at['thread_type']})")
             results.append({'customer_id': customer_id, 'success': True})
@@ -4778,11 +4817,11 @@ os.chdir('{self.workspace_path}')
         Each invocation gets a unique ID and independently sampled duration/quality.
 
         Args:
-            tier: The tier number to start (1-20)
+            tier: The tier number to start (1-10)
         """
         rt = RESEARCH_TIERS_BY_ID.get(tier)
         if not rt:
-            return ToolResult(False, f"Unknown tier {tier}. Valid tiers: 1-20.")
+            return ToolResult(False, f"Unknown tier {tier}. Valid tiers: 1-10.")
 
         # Check if this tier already has an in_progress invocation
         in_progress = self.conn.execute(
@@ -4809,13 +4848,10 @@ os.chdir('{self.workspace_path}')
             -rt.cost, f"R&D Tier {tier}: {rt.name} ({invocation_id})"
         )
 
-        # Path-independent RNG: seeded by (global_seed, "research", tier, invocation_count)
-        # so results depend only on which tier and how many times it's been started, not on other RNG usage
-        research_seed = hash((self.seed, "research", tier, count)) % (2**31)
-        research_rng = default_rng(research_seed)
+        research_rng = default_rng([self.seed, tier, count, 0x524E44])
 
         # Sample duration from Normal(mean_days, std_days), minimum 30 days
-        sampled_duration = max(30, int(research_rng.normal(rt.mean_days, rt.std_days)))
+        sampled_duration = max(1, int(research_rng.normal(rt.mean_days, rt.std_days)))
         completion_day = self.current_day + sampled_duration
 
         # Sample quality boost from Normal(mean_quality_boost, std_quality_boost), minimum 0.001
@@ -4825,7 +4861,9 @@ os.chdir('{self.workspace_path}')
         self.conn.execute("""
             INSERT INTO research_projects (project_id, tier, status, started_day, expected_completion_day, expected_quality_boost)
             VALUES (?, ?, 'in_progress', ?, ?, ?)
-        """, (invocation_id, tier, self.current_day, completion_day, sampled_quality))
+        """, (invocation_id, tier, self.current_day, self.current_day + rt.mean_days, rt.mean_quality_boost))
+        self.conn.execute("INSERT INTO _hidden_research_outcomes VALUES (?, ?, ?)",
+                          (invocation_id, completion_day, sampled_quality))
 
         self.conn.commit()
 
@@ -4833,17 +4871,17 @@ os.chdir('{self.workspace_path}')
             f"=== R&D Tier Started ===\n"
             f"Tier {tier}: {rt.name} (invocation {invocation_id})\n"
             f"Cost: ${rt.cost:,.0f} (deducted)\n"
-            f"Expected completion: ~day {completion_day} ({sampled_duration} days)\n"
-            f"Expected quality boost: +{sampled_quality:.3f}\n"
+            f"Expected completion: ~day {self.current_day + rt.mean_days} ({rt.mean_days} days)\n"
+            f"Expected quality boost: +{rt.mean_quality_boost:.3f}\n"
             f"Description: {rt.description}",
             data={
                 'project_id': invocation_id,
                 'tier': tier,
                 'name': rt.name,
                 'cost': rt.cost,
-                'expected_completion_day': completion_day,
-                'expected_duration_days': sampled_duration,
-                'expected_quality_boost': round(sampled_quality, 4),
+                'expected_completion_day': self.current_day + rt.mean_days,
+                'expected_duration_days': rt.mean_days,
+                'expected_quality_boost': rt.mean_quality_boost,
             }
         )
 

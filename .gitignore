@@ -124,6 +124,7 @@ tests/*
 !tests/test_ceobench_group_research_and_insights.py
 !tests/test_ceobench_initial_conditions.py
 !tests/test_ceobench_rnd_projects.py
+!tests/test_release_rules.py
 !tests/test_ceobench_segment_discovery.py
 tools/
 variants/
