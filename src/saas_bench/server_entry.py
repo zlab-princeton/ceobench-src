@@ -335,7 +335,8 @@ def cmd_start_server(args, base: Path):
                 meta['history_projection_error'] = 'projection_stale_use_history_command'
             meta.update(current_day=snapshot['day'], ledger_day=snapshot['day'],
                         cash=snapshot['cash'], snapshot_at=snapshot['snapshot_at'],
-                        status='running', integrity_version=1)
+                        status='bankrupt' if (snapshot['cash'] is not None and snapshot['cash'] < 0) else 'running',
+                        integrity_version=1)
             atomic_json(meta_path, meta)
 
         def publish_failure():

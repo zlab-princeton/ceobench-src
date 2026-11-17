@@ -17,7 +17,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Set
 
 from .tools import AgentTools, ToolResult
-from .database import TABLE_DOCS
+from .database import TABLE_DOCS, get_cash
 from .environment import build_weekly_dashboard
 
 
@@ -778,6 +778,12 @@ class NovaMindAPIServer:
             if self.simulator is None:
                 return {"success": False, "error": "No simulator configured"}
             old_day = self.tools.current_day
+            # Bankruptcy ends the game (cash < 0). The in-memory flag is lost on a server
+            # restart, but the negative balance is persisted, so check both.
+            if self.simulator.shutdown_mode or (self.conn is not None and get_cash(self.conn) < 0):
+                return {"success": False, "error": "game_over_bankrupt",
+                        "message": f"GAME OVER - BANKRUPT! Cash went below $0 (day {old_day}). "
+                                   "The game has ended; no further days can be simulated."}
 
         # Log rationale BEFORE stepping so it's attributed to the day the
         # decisions were made, not the post-step day.
@@ -854,17 +860,24 @@ class NovaMindAPIServer:
             week = (new_day + 6) // 7
             dashboard = f"=== Week {week} Dashboard (Day {new_day}) ===\n(No dashboard data available)"
 
+        if self.simulator.shutdown_mode:
+            dashboard = (f"GAME OVER - BANKRUPT! Cash went below $0 on day {new_day}. "
+                         "The game has ended; no further days can be simulated.\n\n" + dashboard)
+
         with self._lock:
             self._last_dashboard = dashboard
 
         if self.day_callback:
             self.day_callback(new_day, dashboard)
 
-        return {
+        result = {
             "success": True,
             "day": new_day,
             "dashboard": dashboard,
         }
+        if self.simulator.shutdown_mode:
+            result["game_over"] = "bankrupt"
+        return result
 
     @property
     def last_dashboard(self) -> str:

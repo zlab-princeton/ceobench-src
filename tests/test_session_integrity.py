@@ -307,3 +307,22 @@ def test_stop_waits_for_exit_not_acknowledgement(tmp_path):
         proc.wait(5)
     finally:
         if proc.poll() is None:proc.kill();proc.wait()
+
+
+def test_bankruptcy_ends_game_and_refuses_further_steps(tmp_path):
+    # Docs: "GAME OVER - BANKRUPT! (when cash < 0)". A bankrupt game must not keep
+    # advancing (previously each later next-week silently advanced one day).
+    conn, sim, tools, shock = world(tmp_path)
+    api = NovaMindAPIServer(tools, sim, conn)
+    conn.execute("INSERT INTO ledger(day,amount,category) VALUES(0,?,'operations')", (1.0 - get_cash(conn),))
+    conn.commit()  # $1 left: the first simulated day's costs make cash negative
+    start = tools.current_day
+    first = api.advance_week()
+    assert first['success'] and first.get('game_over') == 'bankrupt'
+    assert first['day'] == start + 1 and 'GAME OVER - BANKRUPT' in first['dashboard']
+    again = api.advance_week()
+    assert again['success'] is False and again['error'] == 'game_over_bankrupt'
+    assert tools.current_day == start + 1
+    sim.shutdown_mode = False  # in-memory flag is lost on a server restart; persisted cash still ends the game
+    assert api.advance_week()['error'] == 'game_over_bankrupt'
+    assert tools.current_day == start + 1
