@@ -1,13 +1,13 @@
 {
   "table": "research_projects",
-  "description": "R&D research tier invocations (in-progress, completed). 20 independent tiers, repeatable \u2014 same tier can be started multiple times. Tiers 1-10: standard R&D. Tiers 11-20: frontier moonshots (higher cost, longer timelines, more variance, better quality/$).",
+  "description": "R&D research tier invocations (in-progress, completed). 10 independent, repeatable tiers. In-progress projects show tier forecasts, not realized outcomes.",
   "columns": {
     "project_id": "TEXT PRIMARY KEY \u2014 Unique invocation ID (e.g., \"t1_1\", \"t1_2\", \"t3_1\")",
-    "tier": "INTEGER \u2014 Tier number (1-20)",
+    "tier": "INTEGER \u2014 Tier number (1-10)",
     "status": "TEXT \u2014 'in_progress', 'completed'",
     "started_day": "INTEGER \u2014 Day this invocation was started",
-    "expected_completion_day": "INTEGER \u2014 Expected completion day (sampled from Normal distribution)",
-    "expected_quality_boost": "REAL \u2014 Sampled quality boost to be applied on completion",
+    "expected_completion_day": "INTEGER \u2014 Forecast completion day (tier mean)",
+    "expected_quality_boost": "REAL \u2014 Forecast quality boost (tier mean)",
     "quality_boost_applied": "REAL \u2014 Actual quality boost applied on completion"
   }
 }

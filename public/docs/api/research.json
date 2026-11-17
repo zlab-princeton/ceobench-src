@@ -7,7 +7,7 @@
     "parameters": {
       "tier": {
         "type": "integer",
-        "description": "The research tier to start (1-20). Use list_research_projects() to see all tiers and their status."
+        "description": "The research tier to start (1-10). Use list_research_projects() to see all tiers and their status."
       }
     },
     "inputSchema": {
@@ -15,7 +15,7 @@
       "properties": {
         "tier": {
           "type": "integer",
-          "description": "Tier number to start (1-20)"
+          "description": "Tier number to start (1-10)"
         }
       },
       "required": [
@@ -23,7 +23,7 @@
       ]
     },
     "returns": {
-      "success": "Tier details including cost, sampled duration, sampled quality boost, invocation ID.",
+      "success": "Tier details including cost, forecast duration, forecast quality boost, invocation ID.",
       "error_not_found": "Unknown tier number",
       "error_in_progress": "Tier already has an in-progress invocation (wait for completion)",
       "error_funds": "Insufficient cash for tier cost"
@@ -33,9 +33,9 @@
       "tier": "int \u2014 tier number",
       "name": "str \u2014 research project name",
       "cost": "float \u2014 cost deducted",
-      "expected_completion_day": "int \u2014 sim day when project completes",
+      "expected_completion_day": "int \u2014 forecast completion day",
       "expected_duration_days": "int \u2014 days until completion",
-      "expected_quality_boost": "float \u2014 sampled quality boost",
+      "expected_quality_boost": "float \u2014 forecast quality boost",
       "_access": "result['expected_completion_day'] \u2192 when to expect completion"
     },
     "impact": "Cash reduced by tier cost. Quality improves permanently when project completes. R&D gives quality jumps that dev spending alone cannot match.",

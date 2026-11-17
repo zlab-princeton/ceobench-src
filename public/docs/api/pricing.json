@@ -123,19 +123,19 @@
     "name": "set_usage_quotas",
     "python_call": "novamind_api.pricing.set_usage_quotas(...)",
     "category": "Business Configuration",
-    "description": "Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota degrades experience.",
+    "description": "Set daily usage quotas (rate limits) per seat for each plan. Exceeding quota degrades experience.",
     "parameters": {
       "A": {
         "type": "int",
-        "description": "Daily usage quota for plan A (units/day per customer)"
+        "description": "Daily usage quota for plan A (units/day per seat)"
       },
       "B": {
         "type": "int",
-        "description": "Daily usage quota for plan B (units/day per customer)"
+        "description": "Daily usage quota for plan B (units/day per seat)"
       },
       "C": {
         "type": "int",
-        "description": "Daily usage quota for plan C (units/day per customer)"
+        "description": "Daily usage quota for plan C (units/day per seat)"
       }
     },
     "inputSchema": {
@@ -165,10 +165,10 @@
       "failure": "Missing quota for plan X / Quota for plan X cannot be negative"
     },
     "output_schema": {
-      "quotas": "Dict[str, int] \u2014 {'A': int, 'B': int, 'C': int} units/day per customer",
+      "quotas": "Dict[str, int] \u2014 {'A': int, 'B': int, 'C': int} units/day per seat",
       "_access": "result['quotas']['A'] \u2192 plan A daily quota"
     },
-    "impact": "Quotas limit per-customer usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.",
+    "impact": "Quotas limit per-seat usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.",
     "example_call": {
       "tool": "set_usage_quotas",
       "arguments": {

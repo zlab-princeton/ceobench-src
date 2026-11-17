@@ -1,0 +1,12 @@
+{
+  "table": "agent_social_media_posts",
+  "description": "Social media posts and replies authored by the agent (CEO). Use post_social_media tool to create.",
+  "columns": {
+    "agent_post_id": "INTEGER PRIMARY KEY \u2014 Unique post ID",
+    "day": "INTEGER \u2014 Day posted",
+    "content": "TEXT \u2014 Post content (max 280 characters)",
+    "reply_to_post_id": "INTEGER \u2014 If replying to a customer post, the post_id (NULL for original posts)",
+    "views": "INTEGER \u2014 View count (updated next day)",
+    "comment_post_ids": "TEXT \u2014 JSON list of post_ids from social_media_posts that are customer comments on this agent post (e.g. [101, 105, 108])"
+  }
+}

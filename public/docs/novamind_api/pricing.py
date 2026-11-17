@@ -47,7 +47,7 @@ def set_model_tiers(A: Optional[int] = None, B: Optional[int] = None, C: Optiona
 
 
 def set_usage_quotas(A: Optional[int] = None, B: Optional[int] = None, C: Optional[int] = None) -> Dict:
-    """Set daily usage quotas for plans A, B, and C.
+    """Set daily usage quotas per seat for plans A, B, and C.
 
     Exceeding quota degrades customer experience.
 
@@ -73,10 +73,10 @@ def set_promotion(global_promotion: Optional[float] = None,
                   by_group: Optional[Dict[str, float]] = None,
                   by_customer: Optional[Dict[int, float]] = None,
                   by_group_plan: Optional[Dict[str, Dict[str, float]]] = None) -> Dict:
-    """Set subscription price promotions (discounts).
+    """Set retail subscription discounts. Negotiated enterprise rates are unaffected.
 
     Args:
-        global_promotion: Default promotion for all subscribers ($/month off).
+        global_promotion: Default promotion for retail subscribers ($/month off).
         by_group: Per-group promotion overrides {group_id: promotion}.
         by_customer: Per-customer promotion overrides {customer_id: promotion}.
         by_group_plan: Per-group-plan promotion {group_id: {plan: promotion}}.

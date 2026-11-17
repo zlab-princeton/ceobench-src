@@ -16,7 +16,7 @@ and run scripts with `./novamind-operation python <script.py>` or
 | `set_targeted_ops_spend` | Set ADDITIONAL operations spending targeted at specific scopes (group, plan, group+plan, individual customer). Each scope runs its own independent Poisson resolution pool on top of the global ops pool. |
 | `set_targeted_dev_spend` | Set ADDITIONAL per-group development spending on top of the global dev spend. Provides a CUMULATIVE per-group quality bonus that grows daily while spending continues. Investment persists even after spending stops. |
 | `set_capacity_tier` | Set infrastructure capacity tier. Higher tiers handle more usage but cost more per day. |
-| `set_usage_quotas` | Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota degrades experience. |
+| `set_usage_quotas` | Set daily usage quotas (rate limits) per seat for each plan. Exceeding quota degrades experience. |
 | `send_enterprise_deal` | Send enterprise deal offerings. Compact tuple format: each deal = [customer_id, [[plan, price_per_seat], ...]]. All contracts are month-to-month (1 month). If the customer has an open negotiation thread, replies to it. If no open thread, initiates renegotiation. Up to 3 offerings per deal. Customer picks the best. Late replies damage relationship (-0.02/day after 1 day grace). No response within 3 days = customer LOST FOREVER. |
 | `python_exec` | Execute Python code for custom data analysis. Has read-only access to the full simulation database. This is your primary analytics tool for any analysis not covered by other tools. |
 | `register_daily_calculation` | Register a named calculation to run automatically at the start of each day. Output appears in dashboard. |
@@ -25,7 +25,7 @@ and run scripts with `./novamind-operation python <script.py>` or
 | `get_social_posts` | Search social media posts about your company. NOTE: Sentiment is NOT provided - you must infer it from the post content. |
 | `post_social_media` | Post a social media message on company social media account. You can either post an original post or reply to an existing customer. Max 280 characters. Limit: 1 post per day. Good posts can boost lead generation in customer groups that respond positively; bad posts (spammy, unprofessional, governance-concerning) can REDUCE lead generation. Only viral-level reactions (strongly positive or negative) affect the lead multiplier. Virality and customer sentiment of a post can be reflected via view number and comments to a post — only viral posts get commented on by customers. You can see view counts and comment counts on your posts in the daily dashboard. |
 | `get_cost_info` | Get current cost structure for compute and capacity. Shows model tier costs and capacity tier costs. |
-| `reject_enterprise_deal` | Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn. |
+| `reject_enterprise_deal` | Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost; rejection ends retention or renewal contracts but preserves terms on plan changes and seller renegotiations. |
 | `next_week` | Advance the simulation by one week (7 days) and receive the weekly dashboard. Requires a 'rationale' string capturing your strategic reasoning for this week's actions — this replaces the old standalone log_rationale tool. |
 | `research_market` | Conduct market research to discover new customer segments. Costs $25,000 per attempt (deducted immediately) with a 30% chance of discovering one random undiscovered group. Result is instant (no delay). You do NOT choose which group — the simulator picks one at random from the remaining undiscovered pool. Discovered groups start at Info Level 1 (±65% accuracy). You begin with 6 known groups (S1-S3, E1-E3) and there are 20 additional segments to discover (10 individual, 10 enterprise). |
 | `research_group` | Research a discovered customer group to a specific info level. Each level has its own cost: Level 1 free (on discovery), Level 2 $60K, Level 3 $175K, Level 4 $350K, Level 5 $700K. Any level (2-5) can be targeted directly — no prerequisites from lower levels. Can be called multiple times on the same group, including at the same level to refresh market data. Each call deducts cost immediately. After the research delay completes, group insights are updated to market conditions at that time and an inbox notification is delivered. Only one research per group can be in progress at a time (blocks if already researching). Use get_group_insights() to retrieve the data. |
@@ -467,13 +467,13 @@ Set ongoing promotion (dollar deduction) for existing subscribers. Applied at ea
 
 **Python:** `novamind_api.pricing.set_usage_quotas(...)`
 
-Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota degrades experience.
+Set daily usage quotas (rate limits) per seat for each plan. Exceeding quota degrades experience.
 
 **Parameters:**
 
-- `A`: {'type': 'int', 'description': 'Daily usage quota for plan A (units/day per customer)'}
-- `B`: {'type': 'int', 'description': 'Daily usage quota for plan B (units/day per customer)'}
-- `C`: {'type': 'int', 'description': 'Daily usage quota for plan C (units/day per customer)'}
+- `A`: {'type': 'int', 'description': 'Daily usage quota for plan A (units/day per seat)'}
+- `B`: {'type': 'int', 'description': 'Daily usage quota for plan B (units/day per seat)'}
+- `C`: {'type': 'int', 'description': 'Daily usage quota for plan C (units/day per seat)'}
 
 **Input Schema:**
 ```json
@@ -505,7 +505,7 @@ Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota
 - success: Usage quotas updated: A=100 units/day, B=500 units/day, C=2,000 units/day
 - failure: Missing quota for plan X / Quota for plan X cannot be negative
 
-**Impact:** Quotas limit per-customer usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.
+**Impact:** Quotas limit per-seat usage to control costs. Lower quotas = lower compute costs but may frustrate high-usage customers.
 
 **Example:**
 ```json
@@ -527,7 +527,7 @@ Set daily usage quotas (rate limits) per customer for each plan. Exceeding quota
 
 **Python:** `novamind_api.enterprise.reject_enterprise_deal(...)`
 
-Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn.
+Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost; rejection ends retention or renewal contracts but preserves terms on plan changes and seller renegotiations.
 
 **Parameters:**
 
@@ -564,10 +564,10 @@ Reject one or more enterprise deals. List-based: each deal identified by custome
 **Returns:**
 - success: Processed 2/2 rejections:
   Customer #312: Rejected (new_lead). Lead marked as lost.
-  Customer #88: Rejected (churn_prevention). Customer may cancel.
+  Customer #88: Rejected (churn_prevention). Subscription cancelled.
 - failure: Customer #312: no active thread / Customer #999: not found
 
-**Impact:** For new_lead threads: lead is permanently lost. For renegotiation/renewal threads: customer CHURNS (cancels subscription). For churn_prevention/plan_change threads: customer churns with reputation damage.
+**Impact:** Rejecting a lead loses it. Rejecting a retention or renewal request cancels service. Rejecting a plan change or seller renegotiation preserves the existing contract. An offer awaiting a customer reply cannot be withdrawn.
 
 **Example:**
 ```json
@@ -1215,7 +1215,7 @@ Start an R&D research tier. Costs deducted immediately. Completes after sampled 
 
 **Parameters:**
 
-- `tier`: {'type': 'integer', 'description': 'The research tier to start (1-20). Use list_research_projects() to see all tiers and their status.'}
+- `tier`: {'type': 'integer', 'description': 'The research tier to start (1-10). Use list_research_projects() to see all tiers and their status.'}
 
 **Input Schema:**
 ```json
@@ -1224,7 +1224,7 @@ Start an R&D research tier. Costs deducted immediately. Completes after sampled 
   "properties": {
     "tier": {
       "type": "integer",
-      "description": "Tier number to start (1-20)"
+      "description": "Tier number to start (1-10)"
     }
   },
   "required": [
@@ -1234,7 +1234,7 @@ Start an R&D research tier. Costs deducted immediately. Completes after sampled 
 ```
 
 **Returns:**
-- success: Tier details including cost, sampled duration, sampled quality boost, invocation ID.
+- success: Tier details including cost, forecast duration, forecast quality boost, invocation ID.
 - error_not_found: Unknown tier number
 - error_in_progress: Tier already has an in-progress invocation (wait for completion)
 - error_funds: Insufficient cash for tier cost

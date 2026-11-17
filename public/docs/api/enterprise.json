@@ -97,7 +97,7 @@
     "name": "reject_enterprise_deal",
     "python_call": "novamind_api.enterprise.reject_enterprise_deal(...)",
     "category": "Customer Communication",
-    "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost, existing customers may churn.",
+    "description": "Reject one or more enterprise deals. List-based: each deal identified by customer_id. The system finds the customer's active negotiation thread automatically. New leads are lost; rejection ends retention or renewal contracts but preserves terms on plan changes and seller renegotiations.",
     "parameters": {
       "deals": {
         "type": "list[Dict]",
@@ -137,14 +137,14 @@
       ]
     },
     "returns": {
-      "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Customer may cancel.",
+      "success": "Processed 2/2 rejections:\n  Customer #312: Rejected (new_lead). Lead marked as lost.\n  Customer #88: Rejected (churn_prevention). Subscription cancelled.",
       "failure": "Customer #312: no active thread / Customer #999: not found"
     },
     "output_schema": {
       "results": "List[Dict] \u2014 one dict per deal with keys: customer_id (int), success (bool), thread_type (str), error (str, if failed)",
       "_access": "for r in result['results']: print(r['customer_id'], r['success'])"
     },
-    "impact": "For new_lead threads: lead is permanently lost. For renegotiation/renewal threads: customer CHURNS (cancels subscription). For churn_prevention/plan_change threads: customer churns with reputation damage.",
+    "impact": "Rejecting a lead loses it. Rejecting a retention or renewal request cancels service. Rejecting a plan change or seller renegotiation preserves the existing contract. An offer awaiting a customer reply cannot be withdrawn.",
     "example_call": {
       "tool": "reject_enterprise_deal",
       "arguments": {

@@ -246,16 +246,16 @@ Cash forecasts submitted by the agent at each next-week call. Populated by the 1
 
 ## `research_projects`
 
-R&D research tier invocations (in-progress, completed). 20 independent tiers, repeatable — same tier can be started multiple times. Tiers 1-10: standard R&D. Tiers 11-20: frontier moonshots (higher cost, longer timelines, more variance, better quality/$).
+R&D research tier invocations (in-progress, completed). 10 independent, repeatable tiers. In-progress projects show tier forecasts, not realized outcomes.
 
 | Column | Description |
 |--------|-------------|
 | `project_id` | TEXT PRIMARY KEY — Unique invocation ID (e.g., "t1_1", "t1_2", "t3_1") |
-| `tier` | INTEGER — Tier number (1-20) |
+| `tier` | INTEGER — Tier number (1-10) |
 | `status` | TEXT — 'in_progress', 'completed' |
 | `started_day` | INTEGER — Day this invocation was started |
-| `expected_completion_day` | INTEGER — Expected completion day (sampled from Normal distribution) |
-| `expected_quality_boost` | REAL — Sampled quality boost to be applied on completion |
+| `expected_completion_day` | INTEGER — Forecast completion day (tier mean) |
+| `expected_quality_boost` | REAL — Forecast quality boost (tier mean) |
 | `quality_boost_applied` | REAL — Actual quality boost applied on completion |
 
 ---
